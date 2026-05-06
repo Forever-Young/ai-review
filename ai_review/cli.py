@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import configparser
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -63,6 +65,7 @@ class PullRequest:
     body: str
     html_url: str
     base_clone_url: str
+    base_ssh_url: str
     base_sha: str
     head_sha: str
     head_ref: str
@@ -91,15 +94,22 @@ class JiraConfig:
 class AppConfig:
     config_file: Path
     cache_dir: Path
+    git_ssh_command: str | None
     ai_provider: str
     codex_model: str | None
+    github_token: str | None
     publish_pending: bool
     max_comments: int
     save_prompt: Path | None
     jira: JiraConfig
 
 
-def run(cmd: list[str], cwd: Path | None = None, input_text: str | None = None) -> str:
+def run(
+    cmd: list[str],
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
     try:
         completed = subprocess.run(
             cmd,
@@ -108,6 +118,7 @@ def run(cmd: list[str], cwd: Path | None = None, input_text: str | None = None) 
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
             check=True,
         )
     except FileNotFoundError as exc:
@@ -161,6 +172,15 @@ def blank_to_none(value: str | None) -> str | None:
     return value or None
 
 
+def config_secret_value(value: str | None) -> str | None:
+    value = blank_to_none(value)
+    if value is None:
+        return None
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value or None
+
+
 def bool_config_value(value: bool) -> str:
     return "yes" if value else "no"
 
@@ -169,6 +189,8 @@ def create_default_config_file(path: Path, args: argparse.Namespace) -> None:
     parser = configparser.ConfigParser()
     parser["git"] = {
         "cache_dir": args.cache_dir or str(DEFAULT_CACHE_DIR),
+        "ssh_key_path": "",
+        "ssh_command": "",
     }
     parser["ai"] = {
         "provider": args.ai_provider or DEFAULT_AI_PROVIDER,
@@ -185,6 +207,7 @@ def create_default_config_file(path: Path, args: argparse.Namespace) -> None:
         "publish_pending": bool_config_value(
             args.publish_pending if args.publish_pending is not None else DEFAULT_PUBLISH_PENDING
         ),
+        "token": "",
     }
     parser["jira"] = {
         "enabled": bool_config_value(args.jira_enabled if args.jira_enabled is not None else DEFAULT_JIRA_ENABLED),
@@ -205,10 +228,13 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     parser = read_config_file(config_file)
 
     cache_dir_raw = args.cache_dir or config_get(parser, "git", "cache_dir")
+    git_ssh_key_path_raw = config_secret_value(config_get(parser, "git", "ssh_key_path"))
+    git_ssh_command = config_secret_value(config_get(parser, "git", "ssh_command"))
     ai_provider = args.ai_provider or config_get(parser, "ai", "provider") or DEFAULT_AI_PROVIDER
     codex_model = blank_to_none(args.codex_model or config_get(parser, "codex", "model"))
     max_comments_raw = args.max_comments if args.max_comments is not None else config_get(parser, "review", "max_comments")
     save_prompt_raw = args.save_prompt or config_get(parser, "review", "save_prompt")
+    github_token = config_secret_value(config_get(parser, "github", "token") or config_get(parser, "github", "key"))
     jira = build_jira_config(args, parser)
 
     publish_pending = DEFAULT_PUBLISH_PENDING
@@ -229,12 +255,18 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         raise SystemExit(f"Invalid max_comments value: {max_comments_raw!r}") from exc
     if max_comments < 1:
         raise SystemExit("max_comments must be at least 1.")
+    if git_ssh_key_path_raw and git_ssh_command:
+        raise SystemExit("Configure either git.ssh_key_path or git.ssh_command, not both.")
+    if git_ssh_key_path_raw:
+        git_ssh_command = git_ssh_command_from_key(expand_path(git_ssh_key_path_raw))
 
     return AppConfig(
         config_file=config_file,
         cache_dir=expand_path(cache_dir_raw) if cache_dir_raw else DEFAULT_CACHE_DIR,
+        git_ssh_command=git_ssh_command,
         ai_provider=ai_provider,
         codex_model=codex_model,
+        github_token=github_token,
         publish_pending=publish_pending,
         max_comments=max_comments,
         save_prompt=expand_path(save_prompt_raw) if save_prompt_raw else None,
@@ -253,7 +285,39 @@ def build_jira_config(args: argparse.Namespace, parser: configparser.ConfigParse
     return JiraConfig(enabled=jira_enabled)
 
 
-def gh_api(path: str, *, method: str = "GET", headers: list[str] | None = None, body: Any = None) -> str:
+def git_ssh_command_from_key(key_path: Path) -> str:
+    return (
+        f"ssh -i {shlex.quote(str(key_path))} "
+        "-o IdentitiesOnly=yes "
+        "-o IdentityAgent=none"
+    )
+
+
+def git_env(git_ssh_command: str | None) -> dict[str, str] | None:
+    if not git_ssh_command:
+        return None
+    env = os.environ.copy()
+    env["GIT_SSH_COMMAND"] = git_ssh_command
+    return env
+
+
+def gh_env(github_token: str | None) -> dict[str, str] | None:
+    if not github_token:
+        return None
+    env = os.environ.copy()
+    env["GH_PROMPT_DISABLED"] = "1"
+    env["GH_TOKEN"] = github_token
+    return env
+
+
+def gh_api(
+    path: str,
+    *,
+    method: str = "GET",
+    headers: list[str] | None = None,
+    body: Any = None,
+    github_token: str | None = None,
+) -> str:
     cmd = ["gh", "api"]
     for header in headers or []:
         cmd.extend(["-H", header])
@@ -262,11 +326,11 @@ def gh_api(path: str, *, method: str = "GET", headers: list[str] | None = None, 
     if body is not None:
         cmd.extend(["--input", "-"])
     cmd.append(path)
-    return run(cmd, input_text=json.dumps(body) if body is not None else None)
+    return run(cmd, input_text=json.dumps(body) if body is not None else None, env=gh_env(github_token))
 
 
-def load_pr(ref: PullRequestRef) -> PullRequest:
-    raw = gh_api(f"repos/{ref.owner}/{ref.repo}/pulls/{ref.number}")
+def load_pr(ref: PullRequestRef, github_token: str | None = None) -> PullRequest:
+    raw = gh_api(f"repos/{ref.owner}/{ref.repo}/pulls/{ref.number}", github_token=github_token)
     data = json.loads(raw)
     return PullRequest(
         ref=ref,
@@ -274,32 +338,35 @@ def load_pr(ref: PullRequestRef) -> PullRequest:
         body=data.get("body") or "",
         html_url=data["html_url"],
         base_clone_url=data["base"]["repo"]["clone_url"],
+        base_ssh_url=data["base"]["repo"].get("ssh_url") or data["base"]["repo"]["clone_url"],
         base_sha=data["base"]["sha"],
         head_sha=data["head"]["sha"],
         head_ref=data["head"]["ref"],
     )
 
 
-def load_first_pr_comment(ref: PullRequestRef) -> str:
-    raw = gh_api(f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments?per_page=1")
+def load_first_pr_comment(ref: PullRequestRef, github_token: str | None = None) -> str:
+    raw = gh_api(f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments?per_page=1", github_token=github_token)
     data = json.loads(raw)
     if not data:
         return ""
     return data[0].get("body") or ""
 
 
-def ensure_checkout(pr: PullRequest, cache_dir: Path) -> Path:
+def ensure_checkout(pr: PullRequest, cache_dir: Path, git_ssh_command: str | None = None) -> Path:
     repos_dir = cache_dir / "repos"
     worktrees_dir = cache_dir / "worktrees"
     repos_dir.mkdir(parents=True, exist_ok=True)
     worktrees_dir.mkdir(parents=True, exist_ok=True)
 
     bare_repo = repos_dir / f"{pr.ref.slug}.git"
+    clone_url = pr.base_ssh_url if git_ssh_command else pr.base_clone_url
+    network_env = git_env(git_ssh_command)
     if not bare_repo.exists():
-        run(["git", "clone", "--mirror", pr.base_clone_url, str(bare_repo)])
+        run(["git", "clone", "--mirror", clone_url, str(bare_repo)], env=network_env)
     else:
-        run(["git", "remote", "set-url", "origin", pr.base_clone_url], cwd=bare_repo)
-        run(["git", "fetch", "--prune", "origin"], cwd=bare_repo)
+        run(["git", "remote", "set-url", "origin", clone_url], cwd=bare_repo)
+        run(["git", "fetch", "--prune", "origin"], cwd=bare_repo, env=network_env)
 
     run(
         [
@@ -309,6 +376,7 @@ def ensure_checkout(pr: PullRequest, cache_dir: Path) -> Path:
             f"+refs/pull/{pr.ref.number}/head:refs/remotes/pull/{pr.ref.number}/head",
         ],
         cwd=bare_repo,
+        env=network_env,
     )
 
     worktree = worktrees_dir / f"{pr.ref.slug}__pr-{pr.ref.number}"
@@ -322,10 +390,11 @@ def ensure_checkout(pr: PullRequest, cache_dir: Path) -> Path:
     return worktree
 
 
-def load_diff(ref: PullRequestRef) -> str:
+def load_diff(ref: PullRequestRef, github_token: str | None = None) -> str:
     return gh_api(
         f"repos/{ref.owner}/{ref.repo}/pulls/{ref.number}",
         headers=["Accept: application/vnd.github.v3.diff"],
+        github_token=github_token,
     )
 
 
@@ -603,7 +672,7 @@ def validate_comments(review: ReviewResult, changed: dict[str, set[int]], max_co
     return ReviewResult(summary=review.summary, comments=valid[:max_comments], pr_comments=review.pr_comments)
 
 
-def create_pending_review(pr: PullRequest, review: ReviewResult) -> int:
+def create_pending_review(pr: PullRequest, review: ReviewResult, github_token: str | None = None) -> int:
     payload = {
         "commit_id": pr.head_sha,
         "body": build_review_body(review),
@@ -621,6 +690,7 @@ def create_pending_review(pr: PullRequest, review: ReviewResult) -> int:
         f"repos/{pr.ref.owner}/{pr.ref.repo}/pulls/{pr.ref.number}/reviews",
         method="POST",
         body=payload,
+        github_token=github_token,
     )
     return int(json.loads(raw)["id"])
 
@@ -707,12 +777,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.pr_url:
         parser.error("the following arguments are required: pr_url")
     ref = parse_pr_url(args.pr_url)
-    pr = load_pr(ref)
+    pr = load_pr(ref, config.github_token)
 
-    checkout = ensure_checkout(pr, config.cache_dir)
-    first_comment = load_first_pr_comment(ref) if config.jira.enabled else ""
+    checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
+    first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
     jira_context = load_jira_context(config.jira, pr, first_comment, checkout, config.codex_model)
-    diff = load_diff(ref)
+    diff = load_diff(ref, config.github_token)
     prompt = build_prompt(pr, diff, jira_context)
     if config.save_prompt:
         config.save_prompt.parent.mkdir(parents=True, exist_ok=True)
@@ -728,7 +798,7 @@ def main(argv: list[str] | None = None) -> int:
     if config.publish_pending:
         if not review.comments and not review.pr_comments and not review.summary:
             raise SystemExit("No review content to publish.")
-        review_id = create_pending_review(pr, review)
+        review_id = create_pending_review(pr, review, config.github_token)
         print(f"Created pending GitHub review #{review_id}. It has not been submitted.")
 
     return 0

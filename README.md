@@ -11,8 +11,10 @@ unsubmitted review draft until you submit them in GitHub.
 
 - Python 3.11+
 - `git`
-- GitHub CLI (`gh`) authenticated with pull request read access
-- For posting pending review comments: `gh` needs pull request write access
+- GitHub CLI (`gh`) with pull request read access, either already authenticated
+  or configured with a token in `ai-review.conf`
+- For posting pending review comments: the GitHub token or `gh` login needs
+  pull request write access
 - `codex` CLI logged in and usable non-interactively
 
 ## Install
@@ -52,6 +54,8 @@ Example:
 ```ini
 [git]
 cache_dir = ~/.local/cache/ai-review
+ssh_key_path =
+ssh_command =
 
 [ai]
 provider = codex
@@ -65,6 +69,7 @@ save_prompt = ~/tmp/ai-review-prompt.txt
 
 [github]
 publish_pending = yes
+token =
 
 [jira]
 enabled = no
@@ -76,9 +81,26 @@ model.
 
 CLI arguments override the config file.
 
+Set `git.ssh_key_path` when repository mirrors should be cloned and fetched
+over SSH with a specific key. When this is set, `ai-review` uses GitHub's SSH
+clone URL and passes git a `GIT_SSH_COMMAND` like:
+
+```sh
+ssh -i /path/to/key -o IdentitiesOnly=yes -o IdentityAgent=none
+```
+
+`IdentitiesOnly=yes` and `IdentityAgent=none` keep SSH from using agent-provided
+keys. Set `git.ssh_command` instead when you want to provide the complete
+`GIT_SSH_COMMAND` value yourself. Configure either `ssh_key_path` or
+`ssh_command`, not both.
+
 `publish_pending = yes` creates an unsubmitted GitHub pending review with draft
 inline comments. The review remains editable in GitHub until you submit it. Use
 `--no-publish-pending` or set `publish_pending = no` for local output.
+
+Set `github.token` to a GitHub token when `gh` should run non-interactively
+without relying on a saved GitHub CLI login. `ai-review` passes the value to
+`gh api` as `GH_TOKEN`.
 
 ## Jira MCP Context
 

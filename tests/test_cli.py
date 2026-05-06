@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from ai_review.cli import (
     DEFAULT_CACHE_DIR,
@@ -17,6 +17,9 @@ from ai_review.cli import (
     changed_right_lines,
     extract_ticket_key_heuristic,
     fetch_jira_tool_context,
+    gh_api,
+    git_ssh_command_from_key,
+    ensure_checkout,
     is_auth_error,
     main,
     parse_pr_url,
@@ -39,6 +42,7 @@ class CliTests(unittest.TestCase):
             body="",
             html_url="https://github.com/example/project/pull/42",
             base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
             base_sha="base",
             head_sha="head",
             head_ref="ABC12-123-something-short-desc",
@@ -53,6 +57,7 @@ class CliTests(unittest.TestCase):
             body="",
             html_url="https://github.com/example/project/pull/42",
             base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
             base_sha="base",
             head_sha="head",
             head_ref="feature/add-stuff",
@@ -126,9 +131,11 @@ class CliTests(unittest.TestCase):
             config = build_config(self.args(config_file=config_path))
 
         self.assertEqual(config.cache_dir, DEFAULT_CACHE_DIR)
+        self.assertIsNone(config.git_ssh_command)
         self.assertEqual(config.config_file, config_path)
         self.assertEqual(config.ai_provider, "codex")
         self.assertIsNone(config.codex_model)
+        self.assertIsNone(config.github_token)
         self.assertEqual(config.publish_pending, DEFAULT_PUBLISH_PENDING)
         self.assertEqual(config.max_comments, 20)
 
@@ -142,11 +149,14 @@ class CliTests(unittest.TestCase):
             parser.read(config_path)
 
         self.assertEqual(parser.get("git", "cache_dir"), str(DEFAULT_CACHE_DIR))
+        self.assertEqual(parser.get("git", "ssh_key_path"), "")
+        self.assertEqual(parser.get("git", "ssh_command"), "")
         self.assertEqual(parser.get("ai", "provider"), "codex")
         self.assertEqual(parser.get("codex", "model"), "")
         self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("review", "max_comments"), "20")
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
+        self.assertEqual(parser.get("github", "token"), "")
 
     def test_missing_config_file_uses_cli_values_when_creating_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -167,10 +177,13 @@ class CliTests(unittest.TestCase):
             parser.read(config_path)
 
         self.assertEqual(config.cache_dir, Path("/tmp/review-cache"))
+        self.assertIsNone(config.git_ssh_command)
         self.assertEqual(config.codex_model, "gpt-5.2")
         self.assertTrue(config.publish_pending)
         self.assertEqual(config.max_comments, 11)
         self.assertEqual(parser.get("git", "cache_dir"), "/tmp/review-cache")
+        self.assertEqual(parser.get("git", "ssh_key_path"), "")
+        self.assertEqual(parser.get("git", "ssh_command"), "")
         self.assertEqual(parser.get("codex", "model"), "gpt-5.2")
         self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("review", "max_comments"), "11")
@@ -184,6 +197,7 @@ class CliTests(unittest.TestCase):
                 """
 [git]
 cache_dir = ~/custom-ai-review-cache
+ssh_command = ssh -i ~/.ssh/custom_key -o IdentitiesOnly=yes -o IdentityAgent=none
 
 [ai]
 provider = codex
@@ -193,6 +207,7 @@ model = gpt-5.2
 
 [github]
 publish_pending = yes
+token = ghp_example
 
 [review]
 max_comments = 7
@@ -204,11 +219,163 @@ save_prompt = ~/review-prompt.txt
             config = build_config(self.args(config_file=config_path))
 
         self.assertEqual(config.cache_dir, Path("~/custom-ai-review-cache").expanduser())
+        self.assertEqual(config.git_ssh_command, "ssh -i ~/.ssh/custom_key -o IdentitiesOnly=yes -o IdentityAgent=none")
         self.assertEqual(config.ai_provider, "codex")
         self.assertEqual(config.codex_model, "gpt-5.2")
+        self.assertEqual(config.github_token, "ghp_example")
         self.assertTrue(config.publish_pending)
         self.assertEqual(config.max_comments, 7)
         self.assertEqual(config.save_prompt, Path("~/review-prompt.txt").expanduser())
+
+    def test_config_file_accepts_github_key_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ai-review.conf"
+            config_path.write_text(
+                """
+[github]
+key = ghp_alias
+""".strip(),
+                encoding="utf-8",
+            )
+
+            config = build_config(self.args(config_file=config_path))
+
+        self.assertEqual(config.github_token, "ghp_alias")
+
+    def test_config_file_strips_quotes_from_github_token(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ai-review.conf"
+            config_path.write_text(
+                """
+[github]
+token = "ghp_quoted"
+""".strip(),
+                encoding="utf-8",
+            )
+
+            config = build_config(self.args(config_file=config_path))
+
+        self.assertEqual(config.github_token, "ghp_quoted")
+
+    def test_config_file_builds_git_ssh_command_from_key_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ai-review.conf"
+            key_path = Path(temp_dir) / "key with spaces"
+            config_path.write_text(
+                f"""
+[git]
+ssh_key_path = {key_path}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            config = build_config(self.args(config_file=config_path))
+
+        self.assertEqual(
+            config.git_ssh_command,
+            f"ssh -i '{key_path}' -o IdentitiesOnly=yes -o IdentityAgent=none",
+        )
+
+    def test_config_file_expands_home_in_git_ssh_key_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ai-review.conf"
+            config_path.write_text(
+                """
+[git]
+ssh_key_path = ~/.ssh/review_key
+""".strip(),
+                encoding="utf-8",
+            )
+
+            config = build_config(self.args(config_file=config_path))
+
+        self.assertEqual(
+            config.git_ssh_command,
+            f"ssh -i {Path('~/.ssh/review_key').expanduser()} -o IdentitiesOnly=yes -o IdentityAgent=none",
+        )
+
+    def test_config_rejects_git_ssh_key_path_and_command_together(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ai-review.conf"
+            config_path.write_text(
+                """
+[git]
+ssh_key_path = ~/.ssh/review_key
+ssh_command = ssh -i ~/.ssh/other_key
+""".strip(),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(SystemExit):
+                build_config(self.args(config_file=config_path))
+
+    def test_git_ssh_command_from_key_bypasses_agent(self):
+        command = git_ssh_command_from_key(Path("/tmp/review key"))
+
+        self.assertEqual(command, "ssh -i '/tmp/review key' -o IdentitiesOnly=yes -o IdentityAgent=none")
+
+    def test_ensure_checkout_uses_ssh_url_and_command_for_network_git(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Add feature",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("ai_review.cli.run", return_value="") as run_mock:
+                checkout = ensure_checkout(pr, Path(temp_dir), "ssh -i /tmp/key -o IdentitiesOnly=yes")
+
+        self.assertEqual(checkout, Path(temp_dir) / "worktrees" / "example__project__pr-42")
+        first_call = run_mock.call_args_list[0]
+        self.assertEqual(
+            first_call,
+            call(
+                ["git", "clone", "--mirror", "git@github.com:example/project.git", str(Path(temp_dir) / "repos" / "example__project.git")],
+                env=first_call.kwargs["env"],
+            ),
+        )
+        self.assertEqual(first_call.kwargs["env"]["GIT_SSH_COMMAND"], "ssh -i /tmp/key -o IdentitiesOnly=yes")
+
+    def test_ensure_checkout_uses_https_without_ssh_command(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Add feature",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("ai_review.cli.run", return_value="") as run_mock:
+                ensure_checkout(pr, Path(temp_dir))
+
+        first_call = run_mock.call_args_list[0]
+        self.assertEqual(first_call.args[0], ["git", "clone", "--mirror", "https://github.com/example/project.git", str(Path(temp_dir) / "repos" / "example__project.git")])
+        self.assertIsNone(first_call.kwargs["env"])
+
+    def test_gh_api_uses_configured_token_environment(self):
+        with patch("ai_review.cli.run", return_value="{}") as run_mock:
+            gh_api("repos/example/project/pulls/42", github_token="ghp_example")
+
+        env = run_mock.call_args.kwargs["env"]
+        self.assertEqual(env["GH_TOKEN"], "ghp_example")
+        self.assertEqual(env["GH_PROMPT_DISABLED"], "1")
+
+    def test_gh_api_does_not_pass_env_without_configured_token(self):
+        with patch("ai_review.cli.run", return_value="{}") as run_mock:
+            gh_api("repos/example/project/pulls/42", github_token=None)
+
+        self.assertIsNone(run_mock.call_args.kwargs["env"])
 
     def test_cli_overrides_config_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
