@@ -263,8 +263,9 @@ runs `mcporter auth jira` and retries the Jira context request. That may open a
 browser OAuth page when cached credentials are missing or stale.
 
 When Jira is enabled, `ai-review` extracts a ticket key from the PR branch,
-title, body, or first PR comment. It recognizes keys like `ABC-123` and
-`ABC12-123`; comments such as `Refs: ABC-123` also work. If a simple scan cannot
+title, body, PR comments written by the PR author, and PR commit messages. It
+recognizes keys like `ABC-123` and `ABC12-123`; comments such as `Refs: ABC-123`
+also work. If a simple scan cannot
 find the key, the selected AI provider is asked to extract it. If a parsed key is
 found but Jira reports it missing, `ai-review` retries once with the AI-extracted
 key. It then loads Jira issue description, comments, and attachments/images

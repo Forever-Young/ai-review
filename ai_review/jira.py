@@ -104,7 +104,7 @@ def jira_issue_title_from_raw(raw: str) -> str | None:
         r"\bsummary\s*:\s*'([^']+)'",
         r"\btitle\s*:\s*'([^']+)'",
     ):
-        match = re.search(pattern, raw, flags=re.IGNOABCASE)
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
         if match:
             title = match.group(1).strip()
             if len(title) > 140:

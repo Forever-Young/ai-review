@@ -108,6 +108,7 @@ class PullRequest:
     base_sha: str
     head_sha: str
     head_ref: str
+    author_login: str = ""
 
 
 @dataclass(frozen=True)
@@ -565,15 +566,40 @@ def load_pr(ref: PullRequestRef, github_token: str | None = None) -> PullRequest
         base_sha=data["base"]["sha"],
         head_sha=data["head"]["sha"],
         head_ref=data["head"]["ref"],
+        author_login=(data.get("user") or {}).get("login") or "",
     )
 
 
-def load_first_pr_comment(ref: PullRequestRef, github_token: str | None = None) -> str:
-    raw = gh_api(f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments?per_page=1", github_token=github_token)
-    data = json.loads(raw)
-    if not data:
-        return ""
-    return data[0].get("body") or ""
+def load_ticket_extraction_context(pr: PullRequest, github_token: str | None = None) -> str:
+    parts: list[str] = []
+
+    if pr.author_login:
+        issue_comments = load_paginated_gh_api(
+            f"repos/{pr.ref.owner}/{pr.ref.repo}/issues/{pr.ref.number}/comments",
+            github_token=github_token,
+        )
+        author_comments = []
+        for item in issue_comments:
+            user = (item.get("user") or {}).get("login") or ""
+            body = str(item.get("body") or "").strip()
+            if user == pr.author_login and body:
+                author_comments.append(body)
+        if author_comments:
+            parts.append("PR comments by author:\n" + "\n\n".join(author_comments))
+
+    pr_commits = load_paginated_gh_api(
+        f"repos/{pr.ref.owner}/{pr.ref.repo}/pulls/{pr.ref.number}/commits",
+        github_token=github_token,
+    )
+    commit_messages = []
+    for item in pr_commits:
+        message = str(((item.get("commit") or {}).get("message")) or "").strip()
+        if message:
+            commit_messages.append(message)
+    if commit_messages:
+        parts.append("PR commit messages:\n" + "\n\n".join(commit_messages))
+
+    return "\n\n".join(parts)
 
 
 def load_paginated_gh_api(path: str, github_token: str | None = None) -> list[Any]:
@@ -801,7 +827,7 @@ def build_prompt(
     ).strip()
 
 
-def build_ticket_extraction_prompt(pr: PullRequest, first_comment: str) -> str:
+def build_ticket_extraction_prompt(pr: PullRequest, ticket_context: str) -> str:
     return textwrap.dedent(
         f"""
         Extract the Jira ticket key for this GitHub pull request.
@@ -822,14 +848,14 @@ def build_ticket_extraction_prompt(pr: PullRequest, first_comment: str) -> str:
         PR body:
         {pr.body}
 
-        First PR comment:
-        {first_comment}
+        Additional PR ticket context (author comments and commit messages):
+        {ticket_context}
         """
     ).strip()
 
 
-def extract_ticket_key_heuristic(pr: PullRequest, first_comment: str) -> str | None:
-    candidates = [pr.head_ref, pr.title, pr.body, first_comment]
+def extract_ticket_key_heuristic(pr: PullRequest, ticket_context: str) -> str | None:
+    candidates = [pr.head_ref, pr.title, pr.body, ticket_context]
     for candidate in candidates:
         match = TICKET_KEY_RE.search(candidate or "")
         if match:
@@ -839,12 +865,12 @@ def extract_ticket_key_heuristic(pr: PullRequest, first_comment: str) -> str | N
 
 def extract_ticket_key_with_ai_provider(
     pr: PullRequest,
-    first_comment: str,
+    ticket_context: str,
     provider: str,
     model: str | None,
 ) -> str | None:
     status("Asking AI provider to identify Jira ticket", provider)
-    raw = run_ai_provider(build_ticket_extraction_prompt(pr, first_comment), None, provider, model)
+    raw = run_ai_provider(build_ticket_extraction_prompt(pr, ticket_context), None, provider, model)
     try:
         data = json.loads(raw.strip())
     except json.JSONDecodeError:
@@ -856,9 +882,9 @@ def extract_ticket_key_with_ai_provider(
     return match.group(1) if match else None
 
 
-def extract_ticket_key(pr: PullRequest, first_comment: str, provider: str, model: str | None) -> str | None:
-    return extract_ticket_key_heuristic(pr, first_comment) or extract_ticket_key_with_ai_provider(
-        pr, first_comment, provider, model
+def extract_ticket_key(pr: PullRequest, ticket_context: str, provider: str, model: str | None) -> str | None:
+    return extract_ticket_key_heuristic(pr, ticket_context) or extract_ticket_key_with_ai_provider(
+        pr, ticket_context, provider, model
     )
 
 
@@ -936,7 +962,7 @@ def fetch_jira_tool_context(label: str, selector: str | None, issue_arg: str, ti
 def load_jira_context(
     config: JiraConfig,
     pr: PullRequest,
-    first_comment: str,
+    ticket_context: str,
     ai_provider: str,
     model: str | None,
 ) -> str | None:
@@ -944,9 +970,9 @@ def load_jira_context(
         status("Skipping Jira context", "disabled")
         return None
     status("Checking Jira context")
-    ticket_key = extract_ticket_key_heuristic(pr, first_comment)
+    ticket_key = extract_ticket_key_heuristic(pr, ticket_context)
     if not ticket_key:
-        ticket_key = extract_ticket_key_with_ai_provider(pr, first_comment, ai_provider, model)
+        ticket_key = extract_ticket_key_with_ai_provider(pr, ticket_context, ai_provider, model)
     if not ticket_key:
         status("No Jira ticket key found")
         return "Jira was enabled, but no ticket key could be extracted from the branch, PR title, PR body, or first PR comment."
@@ -957,7 +983,7 @@ def load_jira_context(
     except SystemExit as exc:
         if not is_jira_ticket_not_found_error(str(exc)):
             raise
-        fallback_key = extract_ticket_key_with_ai_provider(pr, first_comment, ai_provider, model)
+        fallback_key = extract_ticket_key_with_ai_provider(pr, ticket_context, ai_provider, model)
         if not fallback_key or fallback_key == ticket_key:
             raise
         status("Primary Jira ticket was not found, retrying with AI-extracted key", fallback_key)
@@ -1032,12 +1058,12 @@ def extract_json_text(raw: str) -> str:
     if not candidate:
         return candidate
     if candidate.startswith("```"):
-        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNOABCASE)
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
         candidate = re.sub(r"\s*```$", "", candidate)
         candidate = candidate.strip()
     if candidate.startswith("{") or candidate.startswith("["):
         return candidate
-    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", raw, flags=re.DOTALL | re.IGNOABCASE)
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
     if fenced_match:
         return fenced_match.group(1).strip()
     start = min((index for index in (candidate.find("{"), candidate.find("[")) if index != -1), default=-1)
@@ -1204,9 +1230,9 @@ def run_review_command(args: argparse.Namespace, config: AppConfig) -> int:
     pr = load_pr(ref, config.github_token)
 
     pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
-    first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
+    ticket_context = load_ticket_extraction_context(pr, config.github_token) if config.jira.enabled else ""
     provider_model = model_for_provider(config, config.ai_provider)
-    jira_context = load_jira_context(config.jira, pr, first_comment, config.ai_provider, provider_model)
+    jira_context = load_jira_context(config.jira, pr, ticket_context, config.ai_provider, provider_model)
     status("Loading pull request diff")
     diff = load_diff(ref, config.github_token)
     status("Building review prompt")
@@ -1291,9 +1317,9 @@ def run_review_to_pending_review_url(pr_url: str, config: AppConfig) -> str:
     pr = load_pr(ref, config.github_token)
 
     pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
-    first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
+    ticket_context = load_ticket_extraction_context(pr, config.github_token) if config.jira.enabled else ""
     provider_model = model_for_provider(config, config.ai_provider)
-    jira_context = load_jira_context(config.jira, pr, first_comment, config.ai_provider, provider_model)
+    jira_context = load_jira_context(config.jira, pr, ticket_context, config.ai_provider, provider_model)
     status("Loading pull request diff")
     diff = load_diff(ref, config.github_token)
     status("Building review prompt")

@@ -29,6 +29,7 @@ from ai_review.cli import (
     is_auth_error,
     load_pr_discussion_context,
     load_jira_context,
+    load_ticket_extraction_context,
     main,
     parse_pr_url,
     parse_review,
@@ -94,6 +95,41 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertEqual(extract_ticket_key_heuristic(pr, ""), "AVO24-256")
+
+    def test_load_ticket_extraction_context_uses_author_comments_and_commit_messages(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="feature work",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+            author_login="author",
+        )
+
+        with patch(
+            "ai_review.cli.load_paginated_gh_api",
+            side_effect=[
+                [
+                    {"user": {"login": "reviewer"}, "body": "Refs: IGNORE-1"},
+                    {"user": {"login": "author"}, "body": "Refs: ABC12-456"},
+                ],
+                [
+                    {"commit": {"message": "ABC-123: implement queue endpoint"}},
+                    {"commit": {"message": "chore: update docs"}},
+                ],
+            ],
+        ):
+            context = load_ticket_extraction_context(pr)
+
+        self.assertIn("PR comments by author", context)
+        self.assertIn("Refs: ABC12-456", context)
+        self.assertNotIn("Refs: IGNORE-1", context)
+        self.assertIn("PR commit messages", context)
+        self.assertIn("ABC-123: implement queue endpoint", context)
 
     def test_load_jira_context_falls_back_to_ai_only_after_jira_not_found(self):
         pr = PullRequest(
