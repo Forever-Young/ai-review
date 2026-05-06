@@ -21,7 +21,7 @@ def run_gemini(
         cmd = ["gemini"]
         if model:
             cmd.extend(["--model", model])
-        status_cb("Running Gemini reviewer", f"model {model}" if model else None)
+        status_cb("Running Gemini AI provider", f"model {model}" if model else None)
         env = os.environ.copy()
         env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
         return run_cmd(cmd, cwd=cwd, input_text=prompt, env=env)

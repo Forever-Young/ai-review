@@ -31,6 +31,7 @@ from ai_review.cli import (
     main,
     parse_pr_url,
     parse_review,
+    parse_review_with_debug_artifacts,
     run_codex,
     run_cursor,
     run_gemini,
@@ -121,6 +122,28 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(review.pr_comments, ["Missing the requested empty-state behavior."])
         self.assertIn("PR-level comments", build_review_body(review))
+
+    def test_parse_review_accepts_fenced_json(self):
+        review = parse_review(
+            """
+```json
+{"summary":"ok","comments":[]}
+```
+""".strip()
+        )
+        self.assertEqual(review.summary, "ok")
+
+    def test_parse_review_extracts_json_after_prefix_text(self):
+        review = parse_review('I found issues\n{"summary":"ok","comments":[]}')
+        self.assertEqual(review.summary, "ok")
+
+    def test_parse_review_with_debug_artifacts_writes_prompt_and_raw_output_paths(self):
+        with self.assertRaises(SystemExit) as caught:
+            parse_review_with_debug_artifacts("not-json", "review prompt", "cursor")
+        message = str(caught.exception)
+        self.assertIn("Reviewer returned invalid JSON", message)
+        self.assertIn("Saved reviewer prompt to:", message)
+        self.assertIn("Saved raw cursor output to:", message)
 
     def test_auth_error_detection(self):
         self.assertTrue(is_auth_error("HTTP 401 unauthorized"))

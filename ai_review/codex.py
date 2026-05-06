@@ -34,7 +34,7 @@ def run_codex(
         if model:
             cmd.extend(["--model", model])
         cmd.append("-")
-        status_cb("Running Codex reviewer", f"model {model}" if model else None)
+        status_cb("Running Codex AI provider", f"model {model}" if model else None)
         stdout = run_cmd(cmd, input_text=prompt)
         if output_file.exists():
             return output_file.read_text(encoding="utf-8")

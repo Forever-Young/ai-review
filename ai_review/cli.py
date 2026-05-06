@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -769,6 +770,9 @@ def build_prompt(
 
         Rules:
         - {context_rule}
+        - Output must be a single JSON object and nothing else.
+        - Do not wrap JSON in markdown fences.
+        - Do not add explanations, prefixes, suffixes, or trailing text.
         - Only comment on added or changed RIGHT-side lines present in the diff.
         - Each body must explain the risk and the change needed.
         - Prefer no comment over a speculative comment.
@@ -971,10 +975,7 @@ def run_ai_provider(prompt: str, cwd: Path | None, provider: str, model: str | N
 
 
 def parse_review(raw: str) -> ReviewResult:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+    raw = extract_json_text(raw)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -995,6 +996,49 @@ def parse_review(raw: str) -> ReviewResult:
 
     pr_comments = [str(item).strip() for item in data.get("pr_comments", []) if str(item).strip()]
     return ReviewResult(summary=str(data.get("summary") or ""), comments=comments, pr_comments=pr_comments)
+
+
+def extract_json_text(raw: str) -> str:
+    candidate = raw.strip()
+    if not candidate:
+        return candidate
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNOABCASE)
+        candidate = re.sub(r"\s*```$", "", candidate)
+        candidate = candidate.strip()
+    if candidate.startswith("{") or candidate.startswith("["):
+        return candidate
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", raw, flags=re.DOTALL | re.IGNOABCASE)
+    if fenced_match:
+        return fenced_match.group(1).strip()
+    start = min((index for index in (candidate.find("{"), candidate.find("[")) if index != -1), default=-1)
+    if start != -1:
+        return candidate[start:].strip()
+    return candidate
+
+
+def write_debug_artifact(prefix: str, suffix: str, content: str) -> Path:
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return Path(path)
+
+
+def parse_review_with_debug_artifacts(raw: str, prompt: str, provider: str) -> ReviewResult:
+    try:
+        return parse_review(raw)
+    except SystemExit as exc:
+        detail = str(exc)
+        if "Reviewer returned invalid JSON" not in detail:
+            raise
+        prompt_path = write_debug_artifact("ai-review-prompt-", ".txt", prompt)
+        output_path = write_debug_artifact("ai-review-reviewer-output-", ".txt", raw)
+        message = (
+            f"{detail}\n"
+            f"Saved reviewer prompt to: {prompt_path}\n"
+            f"Saved raw {provider} output to: {output_path}"
+        )
+        raise SystemExit(message) from exc
 
 
 def validate_comments(review: ReviewResult, changed: dict[str, set[int]], max_comments: int) -> ReviewResult:
@@ -1148,7 +1192,11 @@ def run_review_command(args: argparse.Namespace, config: AppConfig) -> int:
         checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
     raw_review = run_ai_provider(prompt, checkout, config.ai_provider, provider_model)
     status("Validating reviewer findings")
-    review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
+    review = validate_comments(
+        parse_review_with_debug_artifacts(raw_review, prompt, config.ai_provider),
+        changed_right_lines(diff),
+        config.max_comments,
+    )
 
     if checkout:
         print(f"Checked out PR head at: {checkout}")
@@ -1231,7 +1279,11 @@ def run_review_to_pending_review_url(pr_url: str, config: AppConfig) -> str:
         checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
     raw_review = run_ai_provider(prompt, checkout, config.ai_provider, provider_model)
     status("Validating reviewer findings")
-    review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
+    review = validate_comments(
+        parse_review_with_debug_artifacts(raw_review, prompt, config.ai_provider),
+        changed_right_lines(diff),
+        config.max_comments,
+    )
     if not review.comments and not review.pr_comments and not review.summary:
         raise SystemExit("No review content to publish.")
     result = create_or_replace_pending_review(pr, review, config.github_token)

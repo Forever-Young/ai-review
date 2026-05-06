@@ -20,5 +20,5 @@ def run_cursor(
         cmd = ["cursor-agent", "--print", "--output-format", "text", "--trust", prompt]
         if model:
             cmd[1:1] = ["--model", model]
-        status_cb("Running Cursor reviewer", f"model {model}" if model else None)
+        status_cb("Running Cursor AI provider", f"model {model}" if model else None)
         return run_cmd(cmd, cwd=cwd)

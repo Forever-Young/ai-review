@@ -21,5 +21,5 @@ def run_claude(
         if model:
             cmd.extend(["--model", model])
         cmd.append(prompt)
-        status_cb("Running Claude reviewer", f"model {model}" if model else None)
+        status_cb("Running Claude AI provider", f"model {model}" if model else None)
         return run_cmd(cmd, cwd=cwd)
