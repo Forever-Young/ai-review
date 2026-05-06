@@ -19,6 +19,7 @@ GitHub.
 - For posting pending review comments: the GitHub token or `gh` login needs
   pull request write access
 - one AI provider CLI logged in and usable non-interactively:
+  - `claude`
   - `codex`
   - `cursor` (via `cursor-agent`)
   - `gemini`
@@ -76,6 +77,9 @@ model =
 [gemini]
 model =
 
+[claude]
+model =
+
 [review]
 max_comments = 20
 smart_review = no
@@ -95,8 +99,9 @@ jira_auth_via_telegram = no
 ```
 
 `ai.provider` selects which local CLI is used for review generation:
-`codex`, `cursor`, or `gemini`.
+`claude`, `codex`, `cursor`, or `gemini`.
 
+- `claude.model` maps to `claude --model ...`
 - `codex.model` maps to `codex exec --model ...`
 - `cursor.model` maps to `cursor-agent --model ...`
 - `gemini.model` maps to `gemini --model ...`
@@ -178,7 +183,7 @@ error instead.
 When you send a non-PR message, the bot shows inline provider buttons with the
 label `choose model or paste PR link`. The selected provider is marked with
 `[current]`. Provider buttons are shown only for provider CLIs that are present
-in `PATH` on the bot host (`codex`, `cursor-agent`, `gemini`). Selection is chat
+in `PATH` on the bot host (`claude`, `codex`, `cursor-agent`, `gemini`). Selection is chat
 state only and does not modify `ai-review.conf`.
 
 `jira_auth_via_telegram = no` keeps Jira reauthentication on the bot host, which
@@ -291,6 +296,7 @@ Use a specific provider and model:
 ai-review https://github.com/OWNER/REPO/pull/123 --ai-provider codex --codex-model gpt-5.2
 ai-review https://github.com/OWNER/REPO/pull/123 --ai-provider cursor --cursor-model any-supported-cursor-model
 ai-review https://github.com/OWNER/REPO/pull/123 --ai-provider gemini --gemini-model gemini-2.5-pro
+ai-review https://github.com/OWNER/REPO/pull/123 --ai-provider claude --claude-model sonnet
 ```
 
 Allow the selected provider to inspect checked-out project files as read-only review context:

@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
+from . import claude as claude_provider
 from . import codex as codex_provider
 from . import cursor as cursor_provider
 from . import gemini as gemini_provider
@@ -33,7 +34,7 @@ DEFAULT_AI_PROVIDER = "codex"
 DEFAULT_PUBLISH_PENDING = True
 DEFAULT_SMART_REVIEW = False
 DEFAULT_MAX_COMMENTS = 20
-SUPPORTED_AI_PROVIDERS = {"codex", "cursor", "gemini"}
+SUPPORTED_AI_PROVIDERS = {"claude", "codex", "cursor", "gemini"}
 DEFAULT_JIRA_ENABLED = False
 DEFAULT_JIRA_MCP_SERVER = "jira"
 DEFAULT_JIRA_ISSUE_TOOL = "jira.get_issue"
@@ -149,6 +150,7 @@ class AppConfig:
     codex_model: str | None
     cursor_model: str | None
     gemini_model: str | None
+    claude_model: str | None
     github_token: str | None
     publish_pending: bool
     smart_review: bool
@@ -279,6 +281,7 @@ def default_config_values(
     codex_model = args.codex_model if use_cli_values and args and args.codex_model else ""
     cursor_model = args.cursor_model if use_cli_values and args and args.cursor_model else ""
     gemini_model = args.gemini_model if use_cli_values and args and args.gemini_model else ""
+    claude_model = args.claude_model if use_cli_values and args and args.claude_model else ""
     max_comments = (
         args.max_comments
         if use_cli_values and args and args.max_comments is not None
@@ -316,6 +319,9 @@ def default_config_values(
         },
         "gemini": {
             "model": gemini_model,
+        },
+        "claude": {
+            "model": claude_model,
         },
         "review": {
             "max_comments": str(max_comments),
@@ -382,6 +388,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     codex_model = blank_to_none(args.codex_model or config_get(parser, "codex", "model"))
     cursor_model = blank_to_none(args.cursor_model or config_get(parser, "cursor", "model"))
     gemini_model = blank_to_none(args.gemini_model or config_get(parser, "gemini", "model"))
+    claude_model = blank_to_none(args.claude_model or config_get(parser, "claude", "model"))
     max_comments_raw = args.max_comments if args.max_comments is not None else config_get(parser, "review", "max_comments")
     save_prompt_raw = args.save_prompt or config_get(parser, "review", "save_prompt")
     github_token = config_secret_value(config_get(parser, "github", "token") or config_get(parser, "github", "key"))
@@ -426,6 +433,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         codex_model=codex_model,
         cursor_model=cursor_model,
         gemini_model=gemini_model,
+        claude_model=claude_model,
         github_token=github_token,
         publish_pending=publish_pending,
         smart_review=smart_review,
@@ -906,6 +914,8 @@ def model_for_provider(config: AppConfig, provider: str) -> str | None:
         return config.cursor_model
     if normalized_provider == "gemini":
         return config.gemini_model
+    if normalized_provider == "claude":
+        return config.claude_model
     return None
 
 
@@ -917,6 +927,8 @@ def run_ai_provider(prompt: str, cwd: Path | None, provider: str, model: str | N
         return cursor_provider.run_cursor(prompt, cwd, model, run_cmd=run, status_cb=status)
     if normalized_provider == "gemini":
         return run_gemini(prompt, cwd, model)
+    if normalized_provider == "claude":
+        return claude_provider.run_claude(prompt, cwd, model, run_cmd=run, status_cb=status)
     supported = ", ".join(sorted(SUPPORTED_AI_PROVIDERS))
     raise SystemExit(f"Unsupported AI provider {provider!r}. Supported providers: {supported}.")
 
@@ -1146,6 +1158,8 @@ def run_review_for_bot_result(pr_url: str, config: AppConfig) -> tuple[bool, str
 
 
 def provider_command(provider: str) -> str:
+    if provider == "claude":
+        return "claude"
     if provider == "codex":
         return "codex"
     if provider == "cursor":
@@ -1219,7 +1233,7 @@ def run_telegram_bot(config: AppConfig) -> int:
         provider for provider in sorted(SUPPORTED_AI_PROVIDERS) if shutil.which(provider_command(provider))
     ]
     if not available_providers:
-        raise SystemExit("No supported AI provider command found in PATH. Install one of: codex, cursor, gemini.")
+        raise SystemExit("No supported AI provider command found in PATH. Install one of: claude, codex, cursor-agent, gemini.")
     selected_provider_by_user: dict[int, str] = {}
 
     def selected_provider_for_user(user_id: int) -> str:
@@ -1357,8 +1371,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ai-provider",
         choices=sorted(SUPPORTED_AI_PROVIDERS),
-        help="AI provider type to use. Defaults to codex. Supported: codex, cursor, gemini.",
+        help="AI provider type to use. Defaults to codex. Supported: claude, codex, cursor, gemini.",
     )
+    parser.add_argument("--claude-model", help="Optional model passed to `claude --model` (claude provider only).")
     parser.add_argument("--codex-model", help="Optional model passed to `codex exec --model` (codex provider only).")
     parser.add_argument("--cursor-model", help="Optional model passed to `cursor-agent --model` (cursor provider only).")
     parser.add_argument("--gemini-model", help="Optional model passed to `gemini --model` (gemini provider only).")

@@ -32,6 +32,7 @@ from ai_review.cli import (
     run_codex,
     run_cursor,
     run_gemini,
+    run_ai_provider,
     run_review_for_bot_result,
     validate_comments,
 )
@@ -146,6 +147,7 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(config.codex_model)
         self.assertIsNone(config.cursor_model)
         self.assertIsNone(config.gemini_model)
+        self.assertIsNone(config.claude_model)
         self.assertIsNone(config.github_token)
         self.assertEqual(config.publish_pending, DEFAULT_PUBLISH_PENDING)
         self.assertEqual(config.smart_review, DEFAULT_SMART_REVIEW)
@@ -170,6 +172,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parser.get("codex", "model"), "")
         self.assertEqual(parser.get("cursor", "model"), "")
         self.assertEqual(parser.get("gemini", "model"), "")
+        self.assertEqual(parser.get("claude", "model"), "")
         self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("telegram", "bot_token"), "")
         self.assertEqual(parser.get("telegram", "authorized_user_id"), "")
@@ -191,6 +194,7 @@ class CliTests(unittest.TestCase):
                     codex_model="gpt-5.2",
                     cursor_model="cursor-model",
                     gemini_model="gemini-2.5-pro",
+                    claude_model="sonnet",
                     publish_pending=True,
                     smart_review=True,
                     max_comments=11,
@@ -205,6 +209,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.codex_model, "gpt-5.2")
         self.assertEqual(config.cursor_model, "cursor-model")
         self.assertEqual(config.gemini_model, "gemini-2.5-pro")
+        self.assertEqual(config.claude_model, "sonnet")
         self.assertTrue(config.publish_pending)
         self.assertTrue(config.smart_review)
         self.assertEqual(config.max_comments, 11)
@@ -214,6 +219,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parser.get("codex", "model"), "gpt-5.2")
         self.assertEqual(parser.get("cursor", "model"), "cursor-model")
         self.assertEqual(parser.get("gemini", "model"), "gemini-2.5-pro")
+        self.assertEqual(parser.get("claude", "model"), "sonnet")
         self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("telegram", "bot_token"), "")
         self.assertEqual(parser.get("telegram", "authorized_user_id"), "")
@@ -300,6 +306,7 @@ key = ghp_alias
         self.assertEqual(parser.get("codex", "model"), "")
         self.assertEqual(parser.get("cursor", "model"), "")
         self.assertEqual(parser.get("gemini", "model"), "")
+        self.assertEqual(parser.get("claude", "model"), "")
         self.assertEqual(parser.get("review", "max_comments"), "20")
         self.assertEqual(parser.get("review", "smart_review"), "no")
         self.assertEqual(parser.get("github", "publish_pending"), "no")
@@ -591,6 +598,7 @@ smart_review = yes
                     codex_model="gpt-5.2",
                     cursor_model="cursor-model",
                     gemini_model="gemini-2.5-pro",
+                    claude_model="sonnet",
                     publish_pending=False,
                     smart_review=False,
                     max_comments=3,
@@ -602,6 +610,7 @@ smart_review = yes
         self.assertEqual(config.codex_model, "gpt-5.2")
         self.assertEqual(config.cursor_model, "cursor-model")
         self.assertEqual(config.gemini_model, "gemini-2.5-pro")
+        self.assertEqual(config.claude_model, "sonnet")
         self.assertFalse(config.publish_pending)
         self.assertFalse(config.smart_review)
         self.assertEqual(config.max_comments, 3)
@@ -727,6 +736,13 @@ smart_review = yes
         env = run_mock.call_args.kwargs["env"]
         self.assertEqual(env["GEMINI_CLI_TRUST_WORKSPACE"], "true")
 
+    def test_run_ai_provider_dispatches_claude(self):
+        with patch("ai_review.cli.claude_provider.run_claude", return_value='{"summary":"ok"}') as claude_mock:
+            raw = run_ai_provider("prompt", None, "claude", "sonnet")
+
+        self.assertEqual(raw, '{"summary":"ok"}')
+        claude_mock.assert_called_once()
+
     def test_main_skips_checkout_when_smart_review_is_disabled(self):
         pr = PullRequest(
             ref=PullRequestRef("example", "project", 42),
@@ -850,6 +866,12 @@ smart_review = yes
 
         self.assertEqual(config.ai_provider, "gemini")
 
+    def test_ai_provider_is_claude_type(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = build_config(self.args(config_file=Path(temp_dir) / "ai-review.conf", ai_provider="claude"))
+
+        self.assertEqual(config.ai_provider, "claude")
+
     def test_main_without_pr_url_still_creates_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "ai-review.conf"
@@ -864,6 +886,7 @@ smart_review = yes
         self.assertEqual(parser.get("codex", "model"), "")
         self.assertEqual(parser.get("cursor", "model"), "")
         self.assertEqual(parser.get("gemini", "model"), "")
+        self.assertEqual(parser.get("claude", "model"), "")
         self.assertEqual(parser.get("git", "cache_dir"), str(DEFAULT_CACHE_DIR))
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
         self.assertEqual(parser.get("review", "smart_review"), "no")
@@ -914,6 +937,7 @@ publish_pending = no
             "codex_model": None,
             "cursor_model": None,
             "gemini_model": None,
+            "claude_model": None,
             "publish_pending": None,
             "max_comments": None,
             "save_prompt": None,
