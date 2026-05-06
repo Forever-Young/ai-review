@@ -9,11 +9,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1144,6 +1145,16 @@ def run_review_for_bot_result(pr_url: str, config: AppConfig) -> tuple[bool, str
         return False, ANSI_ESCAPE_RE.sub("", f"{type(exc).__name__}: {exc}")
 
 
+def provider_command(provider: str) -> str:
+    if provider == "codex":
+        return "codex"
+    if provider == "cursor":
+        return "cursor"
+    if provider == "gemini":
+        return "gemini"
+    return provider
+
+
 def run_review_to_pending_review_url(pr_url: str, config: AppConfig) -> str:
     if not config.publish_pending:
         raise SystemExit("telegram bot mode requires github.publish_pending = yes so it can return a pending review link.")
@@ -1197,11 +1208,59 @@ def run_telegram_bot(config: AppConfig) -> int:
         raise SystemExit("Configure telegram.bot_token before running `ai-review bot`.")
     try:
         from telegram import Update
-        from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes, MessageHandler, filters
     except ImportError as exc:
         raise SystemExit(
             "Telegram bot support is not installed. Install it with `python3 -m pip install 'ai-review[bot]'`."
         ) from exc
+
+    available_providers = [
+        provider for provider in sorted(SUPPORTED_AI_PROVIDERS) if shutil.which(provider_command(provider))
+    ]
+    if not available_providers:
+        raise SystemExit("No supported AI provider command found in PATH. Install one of: codex, cursor, gemini.")
+    selected_provider_by_user: dict[int, str] = {}
+
+    def selected_provider_for_user(user_id: int) -> str:
+        selected = selected_provider_by_user.get(user_id) or config.ai_provider
+        if selected not in available_providers:
+            return available_providers[0]
+        return selected
+
+    def provider_keyboard(user_id: int) -> InlineKeyboardMarkup:
+        current = selected_provider_for_user(user_id)
+        row = []
+        for provider in available_providers:
+            label = provider
+            if provider == current:
+                label = f"{label} [current]"
+            row.append(InlineKeyboardButton(label, callback_data=f"provider:{provider}"))
+        return InlineKeyboardMarkup([row])
+
+    async def show_provider_prompt(message_obj: Any, user_id: int) -> None:
+        await message_obj.reply_text("choose model or paste PR link", reply_markup=provider_keyboard(user_id))
+
+    async def handle_provider_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None or query.from_user is None:
+            return
+        user_id = query.from_user.id
+        authorized_user_id = config.telegram.authorized_user_id
+        if authorized_user_id is not None and user_id != authorized_user_id:
+            await query.answer()
+            return
+        data = query.data or ""
+        if not data.startswith("provider:"):
+            await query.answer()
+            return
+        provider = data.split(":", 1)[1].strip().lower()
+        if provider not in available_providers:
+            await query.answer("Provider command not found.", show_alert=False)
+            return
+        selected_provider_by_user[user_id] = provider
+        await query.answer(f"Provider set to {provider}")
+        await query.edit_message_text("choose model or paste PR link", reply_markup=provider_keyboard(user_id))
 
     async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_user is None or update.message is None:
@@ -1215,8 +1274,10 @@ def run_telegram_bot(config: AppConfig) -> int:
             return
         text = (update.message.text or "").strip()
         if not text or not GITHUB_PR_RE.match(text):
-            await update.message.reply_text("Send a GitHub pull request URL.")
+            await show_provider_prompt(update.message, user_id)
             return
+        selected_provider = selected_provider_for_user(user_id)
+        review_config = replace(config, ai_provider=selected_provider)
         progress_message = await update.message.reply_text("Review started.")
         progress_lines = ["Review started."]
         loop = asyncio.get_running_loop()
@@ -1248,7 +1309,7 @@ def run_telegram_bot(config: AppConfig) -> int:
                 lambda: mcporter_auth_streaming(DEFAULT_JIRA_MCP_SERVER, DEFAULT_MCP_TIMEOUT_MS)
             )
         try:
-            ok, output = await asyncio.to_thread(run_review_for_bot_result, text, config)
+            ok, output = await asyncio.to_thread(run_review_for_bot_result, text, review_config)
         finally:
             STATUS_LISTENER.reset(status_token)
             if jira_auth_token is not None:
@@ -1267,6 +1328,7 @@ def run_telegram_bot(config: AppConfig) -> int:
             await update.message.reply_text(chunk)
 
     application = ApplicationBuilder().token(config.telegram.bot_token).build()
+    application.add_handler(CallbackQueryHandler(handle_provider_button, pattern=r"^provider:"))
     application.add_handler(MessageHandler(filters.TEXT, handle_message))
     status("Starting Telegram bot")
     application.run_polling()

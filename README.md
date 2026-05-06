@@ -175,6 +175,12 @@ progress message while the review runs. On success, the final chat message is
 only the GitHub pending review link. On failure, the final chat message is the
 error instead.
 
+When you send a non-PR message, the bot shows inline provider buttons with the
+label `choose model or paste PR link`. The selected provider is marked with
+`[current]`. Provider buttons are shown only for provider CLIs that are present
+in `PATH` on the bot host (`codex`, `cursor`, `gemini`). Selection is chat
+state only and does not modify `ai-review.conf`.
+
 `jira_auth_via_telegram = no` keeps Jira reauthentication on the bot host, which
 matches CLI behavior. Set it to `yes` to let the bot stream MCPorter auth output
 to Telegram when a Jira MCP call reports an auth error. If MCPorter or the Jira
