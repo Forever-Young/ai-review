@@ -70,16 +70,15 @@ publish_pending = yes
 enabled = no
 ```
 
-`provider = codex` is the default and currently the only supported provider
-type. Leave `codex.model` blank to let the local Codex CLI choose its configured
-default model.
+`provider = codex` uses the local Codex CLI for review generation. Leave
+`codex.model` blank to let the local Codex CLI choose its configured default
+model.
 
 CLI arguments override the config file.
 
-`publish_pending = yes` means `ai-review` creates an unsubmitted GitHub pending
-review with draft inline comments. It never submits the review; you still edit,
-delete, or submit comments yourself in GitHub. Use `--no-publish-pending` or set
-`publish_pending = no` for local output only.
+`publish_pending = yes` creates an unsubmitted GitHub pending review with draft
+inline comments. The review remains editable in GitHub until you submit it. Use
+`--no-publish-pending` or set `publish_pending = no` for local output.
 
 ## Jira MCP Context
 
@@ -111,10 +110,10 @@ Authenticate the configured Jira MCP server:
 ai-review --jira-auth
 ```
 
-You normally only need to do this once. If Jira is enabled and a later MCP call
-fails with an authentication or expired-token error, `ai-review` automatically
-runs `mcporter auth jira` and retries the Jira context request once. That may
-open a browser OAuth page when cached credentials are missing or stale.
+After authentication, MCPorter reuses cached credentials. If Jira is enabled and
+a later MCP call fails with an authentication or expired-token error, `ai-review`
+runs `mcporter auth jira` and retries the Jira context request. That may open a
+browser OAuth page when cached credentials are missing or stale.
 
 When Jira is enabled, `ai-review` extracts a ticket key from the PR branch,
 title, body, or first PR comment. It recognizes keys like `ABC-123` and

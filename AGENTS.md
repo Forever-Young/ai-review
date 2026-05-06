@@ -9,29 +9,29 @@ GitHub pending review for the user to edit before submission.
 
 ## Project Conventions
 
-- Keep the package stdlib-only unless a dependency has a clear operational
-  benefit.
+- Keep the package focused on the standard library; add dependencies when they
+  provide a clear operational benefit.
 - The installed CLI entry point is `ai-review`; `python -m ai_review` should
   keep working too.
 - Configuration is read from `~/.config/ai-review/ai-review.conf`, with CLI
   arguments taking precedence.
 - The default cache directory is `~/.local/cache/ai-review`.
-- `ai.provider` is a provider type. The only supported type for now is `codex`.
+- `ai.provider` is a provider type; `codex` runs the local Codex CLI.
 - Keep Codex-specific options under the `[codex]` config section, including
   `model`.
-- Do not add a generic shell-command AI provider unless the project direction
-  explicitly changes.
 - Jira support is optional context loading through `mcporter`; keep it separate
   from the AI provider implementation.
-- The public Jira configuration should stay enabled/disabled only:
-  `[jira] enabled = yes|no`. Do not expose MCP tool selectors in the user config
-  unless the project direction explicitly changes.
+- Jira configuration uses `[jira] enabled = yes|no`.
 - Jira auth is handled through `mcporter auth jira`. If Jira MCP calls fail with
   stale or missing auth, the CLI should authenticate once and retry the failed
   context request once.
 - The review result supports both inline `comments` and PR-level `pr_comments`.
   Use PR-level comments for ticket-scope gaps or broad findings that do not map
   to a changed diff line.
+- Write docs as current-state product documentation. Avoid historical language
+  about how behavior changed during implementation, such as saying a feature is
+  now "only" available in a certain form because an earlier version worked
+  differently.
 
 ## Verification
 
