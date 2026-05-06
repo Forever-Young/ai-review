@@ -1149,7 +1149,7 @@ def provider_command(provider: str) -> str:
     if provider == "codex":
         return "codex"
     if provider == "cursor":
-        return "cursor"
+        return "cursor-agent"
     if provider == "gemini":
         return "gemini"
     return provider
@@ -1357,7 +1357,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="AI provider type to use. Defaults to codex. Supported: codex, cursor, gemini.",
     )
     parser.add_argument("--codex-model", help="Optional model passed to `codex exec --model` (codex provider only).")
-    parser.add_argument("--cursor-model", help="Optional model passed to `cursor --model` (cursor provider only).")
+    parser.add_argument("--cursor-model", help="Optional model passed to `cursor-agent --model` (cursor provider only).")
     parser.add_argument("--gemini-model", help="Optional model passed to `gemini --model` (gemini provider only).")
     parser.add_argument(
         "--publish-pending",

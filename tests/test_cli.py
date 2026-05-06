@@ -711,7 +711,7 @@ smart_review = yes
 
         self.assertEqual(raw, '{"summary": "ok"}')
         cmd = run_mock.call_args.args[0]
-        self.assertEqual(cmd, ["cursor"])
+        self.assertEqual(cmd, ["cursor-agent", "--print", "--output-format", "text", "--trust", "prompt"])
         cwd = run_mock.call_args.kwargs["cwd"]
         self.assertEqual(cwd.name, "empty-workspace")
 

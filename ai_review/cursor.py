@@ -17,8 +17,8 @@ def run_cursor(
         if cwd is None:
             cwd = Path(temp_dir) / "empty-workspace"
             cwd.mkdir()
-        cmd = ["cursor"]
+        cmd = ["cursor-agent", "--print", "--output-format", "text", "--trust", prompt]
         if model:
-            cmd.extend(["--model", model])
+            cmd[1:1] = ["--model", model]
         status_cb("Running Cursor reviewer", f"model {model}" if model else None)
-        return run_cmd(cmd, cwd=cwd, input_text=prompt)
+        return run_cmd(cmd, cwd=cwd)

@@ -20,7 +20,7 @@ GitHub.
   pull request write access
 - one AI provider CLI logged in and usable non-interactively:
   - `codex`
-  - `cursor`
+  - `cursor` (via `cursor-agent`)
   - `gemini`
 
 ## Install
@@ -98,7 +98,7 @@ jira_auth_via_telegram = no
 `codex`, `cursor`, or `gemini`.
 
 - `codex.model` maps to `codex exec --model ...`
-- `cursor.model` maps to `cursor --model ...`
+- `cursor.model` maps to `cursor-agent --model ...`
 - `gemini.model` maps to `gemini --model ...`
 
 Leave provider model values blank to let each CLI use its own default.
@@ -178,7 +178,7 @@ error instead.
 When you send a non-PR message, the bot shows inline provider buttons with the
 label `choose model or paste PR link`. The selected provider is marked with
 `[current]`. Provider buttons are shown only for provider CLIs that are present
-in `PATH` on the bot host (`codex`, `cursor`, `gemini`). Selection is chat
+in `PATH` on the bot host (`codex`, `cursor-agent`, `gemini`). Selection is chat
 state only and does not modify `ai-review.conf`.
 
 `jira_auth_via_telegram = no` keeps Jira reauthentication on the bot host, which
