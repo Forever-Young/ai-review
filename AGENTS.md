@@ -2,10 +2,10 @@
 
 `ai-review` is a Python CLI package for running AI-assisted reviews of GitHub
 pull requests from a PR URL. It caches repository mirrors and PR worktrees,
-collects the PR diff through `gh`, asks the configured AI provider for
-structured inline findings, validates those findings against changed diff lines,
-and can create an unsubmitted GitHub pending review for the user to edit before
-submission.
+collects the PR diff through `gh`, optionally loads Jira ticket context through
+MCPorter, asks the configured AI provider for structured findings, validates
+inline findings against changed diff lines, and can create an unsubmitted
+GitHub pending review for the user to edit before submission.
 
 ## Project Conventions
 
@@ -23,6 +23,15 @@ submission.
   explicitly changes.
 - Jira support is optional context loading through `mcporter`; keep it separate
   from the AI provider implementation.
+- The public Jira configuration should stay enabled/disabled only:
+  `[jira] enabled = yes|no`. Do not expose MCP tool selectors in the user config
+  unless the project direction explicitly changes.
+- Jira auth is handled through `mcporter auth jira`. If Jira MCP calls fail with
+  stale or missing auth, the CLI should authenticate once and retry the failed
+  context request once.
+- The review result supports both inline `comments` and PR-level `pr_comments`.
+  Use PR-level comments for ticket-scope gaps or broad findings that do not map
+  to a changed diff line.
 
 ## Verification
 
