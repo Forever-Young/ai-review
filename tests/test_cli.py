@@ -240,6 +240,41 @@ save_prompt = ~/review-prompt.txt
         self.assertEqual(config.max_comments, 7)
         self.assertEqual(config.save_prompt, Path("~/review-prompt.txt").expanduser())
 
+    def test_existing_config_file_is_backfilled_with_missing_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ai-review.conf"
+            config_path.write_text(
+                """
+[git]
+cache_dir = /custom-cache
+
+[github]
+publish_pending = no
+key = ghp_alias
+""".strip(),
+                encoding="utf-8",
+            )
+
+            config = build_config(self.args(config_file=config_path))
+
+            parser = configparser.ConfigParser()
+            parser.read(config_path)
+
+        self.assertEqual(config.cache_dir, Path("/custom-cache"))
+        self.assertFalse(config.publish_pending)
+        self.assertEqual(config.github_token, "ghp_alias")
+        self.assertEqual(parser.get("git", "cache_dir"), "/custom-cache")
+        self.assertEqual(parser.get("git", "ssh_key_path"), "")
+        self.assertEqual(parser.get("git", "ssh_command"), "")
+        self.assertEqual(parser.get("ai", "provider"), "codex")
+        self.assertEqual(parser.get("codex", "model"), "")
+        self.assertEqual(parser.get("review", "max_comments"), "20")
+        self.assertEqual(parser.get("review", "smart_review"), "no")
+        self.assertEqual(parser.get("github", "publish_pending"), "no")
+        self.assertEqual(parser.get("github", "key"), "ghp_alias")
+        self.assertEqual(parser.get("github", "token"), "")
+        self.assertEqual(parser.get("jira", "enabled"), "no")
+
     def test_config_file_accepts_github_key_alias(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "ai-review.conf"
@@ -712,6 +747,29 @@ smart_review = yes
         self.assertEqual(parser.get("git", "cache_dir"), str(DEFAULT_CACHE_DIR))
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
         self.assertEqual(parser.get("review", "smart_review"), "no")
+
+    def test_main_without_pr_url_backfills_existing_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ai-review.conf"
+            config_path.write_text(
+                """
+[github]
+publish_pending = no
+""".strip(),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(SystemExit):
+                main(["--config-file", str(config_path)])
+
+            parser = configparser.ConfigParser()
+            parser.read(config_path)
+
+        self.assertEqual(parser.get("github", "publish_pending"), "no")
+        self.assertEqual(parser.get("git", "cache_dir"), str(DEFAULT_CACHE_DIR))
+        self.assertEqual(parser.get("review", "max_comments"), "20")
+        self.assertEqual(parser.get("review", "smart_review"), "no")
+        self.assertEqual(parser.get("jira", "enabled"), "no")
 
     def args(self, **overrides):
         values = {

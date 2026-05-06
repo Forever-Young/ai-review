@@ -22,6 +22,7 @@ DEFAULT_CACHE_DIR = Path("~/.local/cache/ai-review").expanduser()
 DEFAULT_AI_PROVIDER = "codex"
 DEFAULT_PUBLISH_PENDING = True
 DEFAULT_SMART_REVIEW = False
+DEFAULT_MAX_COMMENTS = 20
 SUPPORTED_AI_PROVIDERS = {"codex"}
 DEFAULT_JIRA_ENABLED = False
 DEFAULT_JIRA_MCP_SERVER = "jira"
@@ -204,40 +205,87 @@ def bool_config_value(value: bool) -> str:
     return "yes" if value else "no"
 
 
-def create_default_config_file(path: Path, args: argparse.Namespace) -> None:
-    parser = configparser.ConfigParser()
-    parser["git"] = {
-        "cache_dir": args.cache_dir or str(DEFAULT_CACHE_DIR),
-        "ssh_key_path": "",
-        "ssh_command": "",
+def default_config_values(
+    args: argparse.Namespace | None = None,
+    *,
+    use_cli_values: bool = False,
+) -> dict[str, dict[str, str]]:
+    cache_dir = args.cache_dir if use_cli_values and args and args.cache_dir else str(DEFAULT_CACHE_DIR)
+    ai_provider = args.ai_provider if use_cli_values and args and args.ai_provider else DEFAULT_AI_PROVIDER
+    codex_model = args.codex_model if use_cli_values and args and args.codex_model else ""
+    max_comments = (
+        args.max_comments
+        if use_cli_values and args and args.max_comments is not None
+        else DEFAULT_MAX_COMMENTS
+    )
+    smart_review = (
+        args.smart_review
+        if use_cli_values and args and args.smart_review is not None
+        else DEFAULT_SMART_REVIEW
+    )
+    publish_pending = (
+        args.publish_pending
+        if use_cli_values and args and args.publish_pending is not None
+        else DEFAULT_PUBLISH_PENDING
+    )
+    jira_enabled = (
+        args.jira_enabled
+        if use_cli_values and args and args.jira_enabled is not None
+        else DEFAULT_JIRA_ENABLED
+    )
+    defaults = {
+        "git": {
+            "cache_dir": cache_dir,
+            "ssh_key_path": "",
+            "ssh_command": "",
+        },
+        "ai": {
+            "provider": ai_provider,
+        },
+        "codex": {
+            "model": codex_model,
+        },
+        "review": {
+            "max_comments": str(max_comments),
+            "smart_review": bool_config_value(smart_review),
+        },
+        "github": {
+            "publish_pending": bool_config_value(publish_pending),
+            "token": "",
+        },
+        "jira": {
+            "enabled": bool_config_value(jira_enabled),
+        },
     }
-    parser["ai"] = {
-        "provider": args.ai_provider or DEFAULT_AI_PROVIDER,
-    }
-    parser["codex"] = {
-        "model": args.codex_model or "",
-    }
-    parser["review"] = {
-        "max_comments": str(args.max_comments if args.max_comments is not None else 20),
-        "smart_review": bool_config_value(
-            args.smart_review if args.smart_review is not None else DEFAULT_SMART_REVIEW
-        ),
-    }
-    if args.save_prompt:
-        parser["review"]["save_prompt"] = args.save_prompt
-    parser["github"] = {
-        "publish_pending": bool_config_value(
-            args.publish_pending if args.publish_pending is not None else DEFAULT_PUBLISH_PENDING
-        ),
-        "token": "",
-    }
-    parser["jira"] = {
-        "enabled": bool_config_value(args.jira_enabled if args.jira_enabled is not None else DEFAULT_JIRA_ENABLED),
-    }
+    if use_cli_values and args and args.save_prompt:
+        defaults["review"]["save_prompt"] = args.save_prompt
+    return defaults
 
+
+def write_config_file(path: Path, parser: configparser.ConfigParser) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as config_file:
         parser.write(config_file)
+
+
+def create_default_config_file(path: Path, args: argparse.Namespace) -> None:
+    parser = configparser.ConfigParser()
+    parser.read_dict(default_config_values(args, use_cli_values=True))
+    write_config_file(path, parser)
+
+
+def update_missing_config_defaults(path: Path, parser: configparser.ConfigParser) -> None:
+    changed = False
+    for section, values in default_config_values().items():
+        if not parser.has_section(section):
+            parser.add_section(section)
+            changed = True
+        for key, value in values.items():
+            if not parser.has_option(section, key):
+                parser.set(section, key, value)
+                changed = True
+    if changed:
+        write_config_file(path, parser)
 
 
 def build_config(args: argparse.Namespace) -> AppConfig:
@@ -248,6 +296,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     if not config_file.exists():
         create_default_config_file(config_file, args)
     parser = read_config_file(config_file)
+    update_missing_config_defaults(config_file, parser)
 
     cache_dir_raw = args.cache_dir or config_get(parser, "git", "cache_dir")
     git_ssh_key_path_raw = config_secret_value(config_get(parser, "git", "ssh_key_path"))

@@ -50,7 +50,8 @@ The default config file is:
 
 If the file does not exist, `ai-review` creates it on startup, even when no PR
 URL is supplied. Config-related CLI flags used on that first invocation are
-written into the new file; existing config files are not rewritten.
+written into the new file. Existing config files are updated on startup with
+missing default sections and keys while preserving configured values.
 
 Example:
 
