@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import configparser
+import contextlib
+import io
 import json
 import os
 import re
@@ -10,9 +13,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 GITHUB_PR_RE = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)(?:[/?#].*)?$")
@@ -30,9 +34,13 @@ DEFAULT_JIRA_ISSUE_TOOL = "jira.get_issue"
 DEFAULT_JIRA_ISSUE_ARG = "issueKey"
 DEFAULT_JIRA_COMMENTS_TOOL = "jira.get_comments"
 DEFAULT_JIRA_ATTACHMENTS_TOOL = "jira.get_attachments"
+DEFAULT_TELEGRAM_AUTHORIZED_USER_ID = ""
+DEFAULT_TELEGRAM_BOT_TOKEN = ""
+DEFAULT_TELEGRAM_JIRA_AUTH_VIA_TELEGRAM = False
 DEFAULT_MCP_TIMEOUT_MS = 60_000
 MAX_CONTEXT_CHARS = 60_000
 TICKET_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 AUTH_ERROR_PATTERNS = (
     "401",
     "403",
@@ -50,6 +58,8 @@ AUTH_ERROR_PATTERNS = (
 STATUS_COLOR = "\033[36m"
 DETAIL_COLOR = "\033[90m"
 RESET_COLOR = "\033[0m"
+STATUS_LISTENER: ContextVar[Callable[[str], None] | None] = ContextVar("STATUS_LISTENER", default=None)
+JIRA_AUTH_HANDLER: ContextVar[Callable[[], None] | None] = ContextVar("JIRA_AUTH_HANDLER", default=None)
 
 
 def status(message: str, detail: str | None = None) -> None:
@@ -57,6 +67,10 @@ def status(message: str, detail: str | None = None) -> None:
     if detail:
         line = f"{line} {DETAIL_COLOR}{detail}{RESET_COLOR}"
     print(line, file=sys.stderr)
+    listener = STATUS_LISTENER.get()
+    if listener:
+        plain_line = ANSI_ESCAPE_RE.sub("", line)
+        listener(plain_line)
 
 
 @dataclass(frozen=True)
@@ -110,6 +124,13 @@ class JiraConfig:
 
 
 @dataclass(frozen=True)
+class TelegramConfig:
+    bot_token: str | None
+    authorized_user_id: int | None
+    jira_auth_via_telegram: bool
+
+
+@dataclass(frozen=True)
 class AppConfig:
     config_file: Path
     cache_dir: Path
@@ -122,6 +143,7 @@ class AppConfig:
     max_comments: int
     save_prompt: Path | None
     jira: JiraConfig
+    telegram: TelegramConfig
 
 
 def run(
@@ -149,6 +171,36 @@ def run(
         detail = stderr or stdout or f"exit code {exc.returncode}"
         raise SystemExit(f"Command failed: {' '.join(cmd)}\n{detail}") from exc
     return completed.stdout
+
+
+def run_streaming(cmd: list[str], cwd: Path | None = None) -> str:
+    try:
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Missing required executable: {cmd[0]}") from exc
+
+    output_lines: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        output_lines.append(line)
+        listener = STATUS_LISTENER.get()
+        if listener:
+            listener(line)
+    return_code = process.wait()
+    output = "\n".join(output_lines)
+    if return_code != 0:
+        detail = output.strip() or f"exit code {return_code}"
+        raise SystemExit(f"Command failed: {' '.join(cmd)}\n{detail}")
+    return output
 
 
 def parse_pr_url(url: str) -> PullRequestRef:
@@ -256,6 +308,11 @@ def default_config_values(
         "jira": {
             "enabled": bool_config_value(jira_enabled),
         },
+        "telegram": {
+            "bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
+            "authorized_user_id": DEFAULT_TELEGRAM_AUTHORIZED_USER_ID,
+            "jira_auth_via_telegram": bool_config_value(DEFAULT_TELEGRAM_JIRA_AUTH_VIA_TELEGRAM),
+        },
     }
     if use_cli_values and args and args.save_prompt:
         defaults["review"]["save_prompt"] = args.save_prompt
@@ -307,6 +364,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     save_prompt_raw = args.save_prompt or config_get(parser, "review", "save_prompt")
     github_token = config_secret_value(config_get(parser, "github", "token") or config_get(parser, "github", "key"))
     jira = build_jira_config(args, parser)
+    telegram = build_telegram_config(parser)
 
     publish_pending = DEFAULT_PUBLISH_PENDING
     configured_publish = config_get(parser, "github", "publish_pending")
@@ -350,6 +408,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         max_comments=max_comments,
         save_prompt=expand_path(save_prompt_raw) if save_prompt_raw else None,
         jira=jira,
+        telegram=telegram,
     )
 
 
@@ -362,6 +421,26 @@ def build_jira_config(args: argparse.Namespace, parser: configparser.ConfigParse
         jira_enabled = args.jira_enabled
 
     return JiraConfig(enabled=jira_enabled)
+
+
+def build_telegram_config(parser: configparser.ConfigParser) -> TelegramConfig:
+    bot_token = config_secret_value(config_get(parser, "telegram", "bot_token"))
+    authorized_user_id_raw = blank_to_none(config_get(parser, "telegram", "authorized_user_id"))
+    jira_auth_via_telegram = DEFAULT_TELEGRAM_JIRA_AUTH_VIA_TELEGRAM
+    configured_jira_auth_via_telegram = config_get(parser, "telegram", "jira_auth_via_telegram")
+    if configured_jira_auth_via_telegram is not None:
+        jira_auth_via_telegram = parse_bool(configured_jira_auth_via_telegram)
+    authorized_user_id: int | None = None
+    if authorized_user_id_raw is not None:
+        try:
+            authorized_user_id = int(authorized_user_id_raw)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid telegram.authorized_user_id value: {authorized_user_id_raw!r}") from exc
+    return TelegramConfig(
+        bot_token=bot_token,
+        authorized_user_id=authorized_user_id,
+        jira_auth_via_telegram=jira_auth_via_telegram,
+    )
 
 
 def git_ssh_command_from_key(key_path: Path) -> str:
@@ -714,6 +793,12 @@ def mcporter_auth(server: str, timeout_ms: int) -> None:
     run(["mcporter", "--oauth-timeout", str(timeout_ms), "auth", server])
 
 
+def mcporter_auth_streaming(server: str, timeout_ms: int) -> None:
+    status("Authenticating Jira MCP server", server)
+    status("Follow any MCPorter auth URL or instructions shown below")
+    run_streaming(["mcporter", "--oauth-timeout", str(timeout_ms), "auth", server])
+
+
 def mcporter_call(selector: str, args: dict[str, Any], timeout_ms: int) -> str:
     status("Calling Jira MCP tool", selector)
     return run(
@@ -751,7 +836,11 @@ def fetch_jira_tool_context(label: str, selector: str | None, issue_arg: str, ti
     except SystemExit as exc:
         if is_auth_error(str(exc)):
             try:
-                mcporter_auth(DEFAULT_JIRA_MCP_SERVER, DEFAULT_MCP_TIMEOUT_MS)
+                auth_handler = JIRA_AUTH_HANDLER.get()
+                if auth_handler:
+                    auth_handler()
+                else:
+                    mcporter_auth(DEFAULT_JIRA_MCP_SERVER, DEFAULT_MCP_TIMEOUT_MS)
                 raw = mcporter_call(selector, {issue_arg: ticket_key}, timeout_ms)
             except SystemExit as retry_exc:
                 return f"{label}: failed to load through {selector} after Jira auth retry: {retry_exc}\n"
@@ -967,9 +1056,203 @@ def print_review(review: ReviewResult) -> None:
         print()
 
 
+def run_review_command(args: argparse.Namespace, config: AppConfig) -> int:
+    if args.jira_auth:
+        mcporter_auth(DEFAULT_JIRA_MCP_SERVER, DEFAULT_MCP_TIMEOUT_MS)
+        if not args.pr_url:
+            return 0
+    if not args.pr_url:
+        raise SystemExit("the following arguments are required: pr_url")
+    ref = parse_pr_url(args.pr_url)
+    status("Loading pull request", f"{ref.owner}/{ref.repo}#{ref.number}")
+    pr = load_pr(ref, config.github_token)
+
+    pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
+    first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
+    jira_context = load_jira_context(config.jira, pr, first_comment, config.codex_model)
+    status("Loading pull request diff")
+    diff = load_diff(ref, config.github_token)
+    status("Building review prompt")
+    prompt = build_prompt(pr, diff, jira_context, pr_discussion_context, config.smart_review)
+    if config.save_prompt:
+        status("Saving review prompt", str(config.save_prompt))
+        config.save_prompt.parent.mkdir(parents=True, exist_ok=True)
+        config.save_prompt.write_text(prompt, encoding="utf-8")
+
+    checkout: Path | None = None
+    if config.smart_review:
+        checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
+    raw_review = run_codex(prompt, checkout, config.codex_model)
+    status("Validating reviewer findings")
+    review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
+
+    if checkout:
+        print(f"Checked out PR head at: {checkout}")
+        print()
+    print_review(review)
+
+    if config.publish_pending:
+        if not review.comments and not review.pr_comments and not review.summary:
+            raise SystemExit("No review content to publish.")
+        result = create_or_replace_pending_review(pr, review, config.github_token)
+        if result.replaced_existing:
+            print(f"Updated pending GitHub review #{result.review_id}. It has not been submitted.")
+        else:
+            print(f"Created pending GitHub review #{result.review_id}. It has not been submitted.")
+        print(f"Open pending review: {result.html_url}")
+
+    return 0
+
+
+def run_review_for_bot(pr_url: str, config: AppConfig) -> str:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            return run_review_to_pending_review_url(pr_url, config)
+    except SystemExit as exc:
+        detail = str(exc)
+        if detail:
+            return detail
+        return f"Review failed with exit code {exc.code}."
+
+
+def run_review_for_bot_result(pr_url: str, config: AppConfig) -> tuple[bool, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            return True, run_review_to_pending_review_url(pr_url, config)
+    except SystemExit as exc:
+        detail = str(exc) or f"Review failed with exit code {exc.code}."
+        return False, ANSI_ESCAPE_RE.sub("", detail)
+    except Exception as exc:
+        return False, ANSI_ESCAPE_RE.sub("", f"{type(exc).__name__}: {exc}")
+
+
+def run_review_to_pending_review_url(pr_url: str, config: AppConfig) -> str:
+    if not config.publish_pending:
+        raise SystemExit("telegram bot mode requires github.publish_pending = yes so it can return a pending review link.")
+    ref = parse_pr_url(pr_url)
+    status("Loading pull request", f"{ref.owner}/{ref.repo}#{ref.number}")
+    pr = load_pr(ref, config.github_token)
+
+    pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
+    first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
+    jira_context = load_jira_context(config.jira, pr, first_comment, config.codex_model)
+    status("Loading pull request diff")
+    diff = load_diff(ref, config.github_token)
+    status("Building review prompt")
+    prompt = build_prompt(pr, diff, jira_context, pr_discussion_context, config.smart_review)
+    if config.save_prompt:
+        status("Saving review prompt", str(config.save_prompt))
+        config.save_prompt.parent.mkdir(parents=True, exist_ok=True)
+        config.save_prompt.write_text(prompt, encoding="utf-8")
+
+    checkout: Path | None = None
+    if config.smart_review:
+        checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
+    raw_review = run_codex(prompt, checkout, config.codex_model)
+    status("Validating reviewer findings")
+    review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
+    if not review.comments and not review.pr_comments and not review.summary:
+        raise SystemExit("No review content to publish.")
+    result = create_or_replace_pending_review(pr, review, config.github_token)
+    return result.html_url
+
+
+def chunk_telegram_message(message: str, limit: int = 3900) -> list[str]:
+    if len(message) <= limit:
+        return [message]
+    chunks = []
+    remaining = message
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def run_telegram_bot(config: AppConfig) -> int:
+    if not config.telegram.bot_token:
+        raise SystemExit("Configure telegram.bot_token before running `ai-review bot`.")
+    try:
+        from telegram import Update
+        from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+    except ImportError as exc:
+        raise SystemExit(
+            "Telegram bot support is not installed. Install it with `python3 -m pip install 'ai-review[bot]'`."
+        ) from exc
+
+    async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_user is None or update.message is None:
+            return
+        user_id = update.effective_user.id
+        authorized_user_id = config.telegram.authorized_user_id
+        if authorized_user_id is None:
+            await update.message.reply_text(f"Your Telegram user ID is {user_id}.")
+            return
+        if user_id != authorized_user_id:
+            return
+        text = (update.message.text or "").strip()
+        if not text or not GITHUB_PR_RE.match(text):
+            await update.message.reply_text("Send a GitHub pull request URL.")
+            return
+        progress_message = await update.message.reply_text("Review started.")
+        progress_lines = ["Review started."]
+        loop = asyncio.get_running_loop()
+
+        async def update_progress(line: str) -> None:
+            progress_lines.append(line)
+            visible = "\n".join(progress_lines[-35:])
+            if len(visible) > 3900:
+                visible = visible[-3900:]
+            try:
+                await progress_message.edit_text(visible)
+            except Exception:
+                pass
+
+        def progress(line: str) -> None:
+            future = asyncio.run_coroutine_threadsafe(update_progress(line), loop)
+            try:
+                future.result(timeout=10)
+            except Exception:
+                pass
+
+        status_token = STATUS_LISTENER.set(progress)
+        jira_auth_token = None
+        if config.telegram.jira_auth_via_telegram:
+            jira_auth_token = JIRA_AUTH_HANDLER.set(
+                lambda: mcporter_auth_streaming(DEFAULT_JIRA_MCP_SERVER, DEFAULT_MCP_TIMEOUT_MS)
+            )
+        try:
+            ok, output = await asyncio.to_thread(run_review_for_bot_result, text, config)
+        finally:
+            STATUS_LISTENER.reset(status_token)
+            if jira_auth_token is not None:
+                JIRA_AUTH_HANDLER.reset(jira_auth_token)
+
+        await update_progress("Review complete." if ok else "Review failed.")
+        for chunk in chunk_telegram_message(output):
+            await update.message.reply_text(chunk)
+
+    application = ApplicationBuilder().token(config.telegram.bot_token).build()
+    application.add_handler(MessageHandler(filters.TEXT, handle_message))
+    status("Starting Telegram bot")
+    application.run_polling()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run an AI review for a GitHub pull request.")
-    parser.add_argument("pr_url", nargs="?", help="GitHub pull request URL")
+    parser = argparse.ArgumentParser(
+        description="Run an AI review for a GitHub pull request.",
+        epilog="Subcommands: bot  Run as a Telegram bot.",
+    )
+    parser.add_argument("pr_url", nargs="?", help="GitHub pull request URL, or `bot` to run the Telegram bot")
     parser.add_argument(
         "--config-file",
         type=Path,
@@ -1021,51 +1304,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     config = build_config(args)
-    if args.jira_auth:
-        mcporter_auth(DEFAULT_JIRA_MCP_SERVER, DEFAULT_MCP_TIMEOUT_MS)
-        if not args.pr_url:
-            return 0
-    if not args.pr_url:
+    if args.pr_url == "bot":
+        return run_telegram_bot(config)
+    if not args.pr_url and not args.jira_auth:
         parser.error("the following arguments are required: pr_url")
-    ref = parse_pr_url(args.pr_url)
-    status("Loading pull request", f"{ref.owner}/{ref.repo}#{ref.number}")
-    pr = load_pr(ref, config.github_token)
-
-    pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
-    first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
-    jira_context = load_jira_context(config.jira, pr, first_comment, config.codex_model)
-    status("Loading pull request diff")
-    diff = load_diff(ref, config.github_token)
-    status("Building review prompt")
-    prompt = build_prompt(pr, diff, jira_context, pr_discussion_context, config.smart_review)
-    if config.save_prompt:
-        status("Saving review prompt", str(config.save_prompt))
-        config.save_prompt.parent.mkdir(parents=True, exist_ok=True)
-        config.save_prompt.write_text(prompt, encoding="utf-8")
-
-    checkout: Path | None = None
-    if config.smart_review:
-        checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
-    raw_review = run_codex(prompt, checkout, config.codex_model)
-    status("Validating reviewer findings")
-    review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
-
-    if checkout:
-        print(f"Checked out PR head at: {checkout}")
-        print()
-    print_review(review)
-
-    if config.publish_pending:
-        if not review.comments and not review.pr_comments and not review.summary:
-            raise SystemExit("No review content to publish.")
-        result = create_or_replace_pending_review(pr, review, config.github_token)
-        if result.replaced_existing:
-            print(f"Updated pending GitHub review #{result.review_id}. It has not been submitted.")
-        else:
-            print(f"Created pending GitHub review #{result.review_id}. It has not been submitted.")
-        print(f"Open pending review: {result.html_url}")
-
-    return 0
+    return run_review_command(args, config)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ ai-review = "ai_review.cli:main"
 
 [project.optional-dependencies]
 jira = []
+bot = ["python-telegram-bot>=21,<23"]
 
 [tool.setuptools.packages.find]
 include = ["ai_review*"]

@@ -30,6 +30,7 @@ from ai_review.cli import (
     parse_pr_url,
     parse_review,
     run_codex,
+    run_review_for_bot_result,
     validate_comments,
 )
 
@@ -145,6 +146,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.publish_pending, DEFAULT_PUBLISH_PENDING)
         self.assertEqual(config.smart_review, DEFAULT_SMART_REVIEW)
         self.assertEqual(config.max_comments, 20)
+        self.assertIsNone(config.telegram.bot_token)
+        self.assertIsNone(config.telegram.authorized_user_id)
+        self.assertFalse(config.telegram.jira_auth_via_telegram)
 
     def test_missing_config_file_is_created_with_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -161,6 +165,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parser.get("ai", "provider"), "codex")
         self.assertEqual(parser.get("codex", "model"), "")
         self.assertEqual(parser.get("jira", "enabled"), "no")
+        self.assertEqual(parser.get("telegram", "bot_token"), "")
+        self.assertEqual(parser.get("telegram", "authorized_user_id"), "")
+        self.assertEqual(parser.get("telegram", "jira_auth_via_telegram"), "no")
         self.assertEqual(parser.get("review", "max_comments"), "20")
         self.assertEqual(parser.get("review", "smart_review"), "no")
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
@@ -196,6 +203,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parser.get("git", "ssh_command"), "")
         self.assertEqual(parser.get("codex", "model"), "gpt-5.2")
         self.assertEqual(parser.get("jira", "enabled"), "no")
+        self.assertEqual(parser.get("telegram", "bot_token"), "")
+        self.assertEqual(parser.get("telegram", "authorized_user_id"), "")
+        self.assertEqual(parser.get("telegram", "jira_auth_via_telegram"), "no")
         self.assertEqual(parser.get("review", "max_comments"), "11")
         self.assertEqual(parser.get("review", "smart_review"), "yes")
         self.assertEqual(parser.get("review", "save_prompt"), "/tmp/prompt.txt")
@@ -224,6 +234,11 @@ token = ghp_example
 max_comments = 7
 smart_review = yes
 save_prompt = ~/review-prompt.txt
+
+[telegram]
+bot_token = "123:abc"
+authorized_user_id = 987
+jira_auth_via_telegram = yes
 """.strip(),
                 encoding="utf-8",
             )
@@ -239,6 +254,9 @@ save_prompt = ~/review-prompt.txt
         self.assertTrue(config.smart_review)
         self.assertEqual(config.max_comments, 7)
         self.assertEqual(config.save_prompt, Path("~/review-prompt.txt").expanduser())
+        self.assertEqual(config.telegram.bot_token, "123:abc")
+        self.assertEqual(config.telegram.authorized_user_id, 987)
+        self.assertTrue(config.telegram.jira_auth_via_telegram)
 
     def test_existing_config_file_is_backfilled_with_missing_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -274,6 +292,23 @@ key = ghp_alias
         self.assertEqual(parser.get("github", "key"), "ghp_alias")
         self.assertEqual(parser.get("github", "token"), "")
         self.assertEqual(parser.get("jira", "enabled"), "no")
+        self.assertEqual(parser.get("telegram", "bot_token"), "")
+        self.assertEqual(parser.get("telegram", "authorized_user_id"), "")
+        self.assertEqual(parser.get("telegram", "jira_auth_via_telegram"), "no")
+
+    def test_config_rejects_invalid_telegram_authorized_user_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ai-review.conf"
+            config_path.write_text(
+                """
+[telegram]
+authorized_user_id = not-a-number
+""".strip(),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(SystemExit):
+                build_config(self.args(config_file=config_path))
 
     def test_config_file_accepts_github_key_alias(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -721,6 +756,36 @@ smart_review = yes
 
         checkout_mock.assert_called_once()
 
+    def test_bot_review_returns_only_pending_review_url_on_success(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Fix checkout",
+            body="PR body",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = build_config(self.args(config_file=Path(temp_dir) / "ai-review.conf"))
+            with patch("ai_review.cli.load_pr", return_value=pr), patch(
+                "ai_review.cli.load_pr_discussion_context", return_value="No comments."
+            ), patch("ai_review.cli.load_jira_context", return_value=None), patch(
+                "ai_review.cli.load_diff", return_value="diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+            ), patch(
+                "ai_review.cli.run_codex", return_value='{"summary": "ok", "comments": []}'
+            ), patch(
+                "ai_review.cli.create_or_replace_pending_review",
+                return_value=type("Result", (), {"html_url": "https://github.com/example/project/pull/42#pullrequestreview-82"})(),
+            ):
+                ok, output = run_review_for_bot_result("https://github.com/example/project/pull/42", config)
+
+        self.assertTrue(ok)
+        self.assertEqual(output, "https://github.com/example/project/pull/42#pullrequestreview-82")
+
     def test_rejects_unknown_ai_provider(self):
         with self.assertRaises(SystemExit):
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -747,6 +812,9 @@ smart_review = yes
         self.assertEqual(parser.get("git", "cache_dir"), str(DEFAULT_CACHE_DIR))
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
         self.assertEqual(parser.get("review", "smart_review"), "no")
+        self.assertEqual(parser.get("telegram", "bot_token"), "")
+        self.assertEqual(parser.get("telegram", "authorized_user_id"), "")
+        self.assertEqual(parser.get("telegram", "jira_auth_via_telegram"), "no")
 
     def test_main_without_pr_url_backfills_existing_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -770,6 +838,18 @@ publish_pending = no
         self.assertEqual(parser.get("review", "max_comments"), "20")
         self.assertEqual(parser.get("review", "smart_review"), "no")
         self.assertEqual(parser.get("jira", "enabled"), "no")
+        self.assertEqual(parser.get("telegram", "bot_token"), "")
+        self.assertEqual(parser.get("telegram", "authorized_user_id"), "")
+        self.assertEqual(parser.get("telegram", "jira_auth_via_telegram"), "no")
+
+    def test_bot_subcommand_requires_configured_token(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "ai-review.conf"
+
+            with self.assertRaises(SystemExit) as caught:
+                main(["--config-file", str(config_path), "bot"])
+
+        self.assertIn("telegram.bot_token", str(caught.exception))
 
     def args(self, **overrides):
         values = {

@@ -78,6 +78,11 @@ token =
 
 [jira]
 enabled = no
+
+[telegram]
+bot_token =
+authorized_user_id =
+jira_auth_via_telegram = no
 ```
 
 `provider = codex` uses the local Codex CLI for review generation. Leave
@@ -118,6 +123,84 @@ When a pending review by the authenticated GitHub user already exists,
 Set `github.token` to a GitHub token when `gh` should run non-interactively
 without relying on a saved GitHub CLI login. `ai-review` passes the value to
 `gh api` as `GH_TOKEN`.
+
+## Telegram Bot
+
+Telegram bot support is optional:
+
+```sh
+python3 -m pip install ".[bot]"
+```
+
+Run the bot with the separate `bot` subcommand:
+
+```sh
+ai-review bot
+```
+
+Create a bot token in Telegram by opening `@BotFather`, running `/newbot`, and
+following its prompts. Copy the HTTP API token into the config file:
+
+```ini
+[telegram]
+bot_token = 123456789:example-token-from-botfather
+authorized_user_id =
+jira_auth_via_telegram = no
+```
+
+`authorized_user_id` is the Telegram user ID allowed to run reviews. Leave it
+blank for the first run, send any message to the bot, and the bot replies with
+your Telegram user ID. Put that number in `authorized_user_id` and restart the
+bot. Once `authorized_user_id` is configured, messages from other Telegram users
+are ignored with no reply.
+
+After authorization is configured, send the bot a GitHub PR URL. It runs the
+same review flow as the CLI using the same config file, including GitHub,
+Codex, Jira, smart review, and pending review settings. The bot edits one
+progress message while the review runs. On success, the final chat message is
+only the GitHub pending review link. On failure, the final chat message is the
+error instead.
+
+`jira_auth_via_telegram = no` keeps Jira reauthentication on the bot host, which
+matches CLI behavior. Set it to `yes` to let the bot stream MCPorter auth output
+to Telegram when a Jira MCP call reports an auth error. If MCPorter or the Jira
+provider prints a URL or code that can be completed from another device, open it
+and finish the auth flow, then the review retries the failed Jira request once.
+If the provider requires a browser redirect to localhost on the bot machine,
+remote Telegram-only reauthentication is not possible for that provider; the bot
+will leave the MCPorter error in the chat.
+
+### macOS LaunchAgent install
+
+The repository includes a macOS installer for the bot service:
+
+```sh
+scripts/install-telegram-bot-macos.sh
+```
+
+It creates a virtualenv at `~/.local/share/ai-review-bot/venv`, installs
+`ai-review[bot]`, creates or updates `~/.config/ai-review/ai-review.conf` with
+default keys, and writes a LaunchAgent plist at:
+
+```text
+~/Library/LaunchAgents/com.ai-review.telegram-bot.plist
+```
+
+After filling `telegram.bot_token`, start the service:
+
+```sh
+launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.ai-review.telegram-bot.plist"
+launchctl kickstart -k gui/$(id -u)/com.ai-review.telegram-bot
+```
+
+After setting `telegram.authorized_user_id`, restart the service:
+
+```sh
+launchctl kickstart -k gui/$(id -u)/com.ai-review.telegram-bot
+```
+
+Logs are written to `~/Library/Logs/ai-review/telegram-bot.out.log` and
+`~/Library/Logs/ai-review/telegram-bot.err.log`.
 
 ## Jira MCP Context
 
