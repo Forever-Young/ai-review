@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -21,4 +22,6 @@ def run_gemini(
         if model:
             cmd.extend(["--model", model])
         status_cb("Running Gemini reviewer", f"model {model}" if model else None)
-        return run_cmd(cmd, cwd=cwd, input_text=prompt)
+        env = os.environ.copy()
+        env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
+        return run_cmd(cmd, cwd=cwd, input_text=prompt, env=env)

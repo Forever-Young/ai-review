@@ -724,6 +724,8 @@ smart_review = yes
         self.assertEqual(cmd, ["gemini", "--model", "gemini-2.5-pro"])
         cwd = run_mock.call_args.kwargs["cwd"]
         self.assertEqual(cwd.name, "empty-workspace")
+        env = run_mock.call_args.kwargs["env"]
+        self.assertEqual(env["GEMINI_CLI_TRUST_WORKSPACE"], "true")
 
     def test_main_skips_checkout_when_smart_review_is_disabled(self):
         pr = PullRequest(

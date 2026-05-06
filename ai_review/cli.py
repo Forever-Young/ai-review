@@ -1269,6 +1269,7 @@ def run_telegram_bot(config: AppConfig) -> int:
         authorized_user_id = config.telegram.authorized_user_id
         if authorized_user_id is None:
             await update.message.reply_text(f"Your Telegram user ID is {user_id}.")
+            await show_provider_prompt(update.message, user_id)
             return
         if user_id != authorized_user_id:
             return
@@ -1321,11 +1322,13 @@ def run_telegram_bot(config: AppConfig) -> int:
                 await progress_message.edit_text(output.strip())
             except Exception:
                 await update.message.reply_text(output.strip())
+            await show_provider_prompt(update.message, user_id)
             return
 
         await update_progress("Review failed.")
         for chunk in chunk_telegram_message(output):
             await update.message.reply_text(chunk)
+        await show_provider_prompt(update.message, user_id)
 
     application = ApplicationBuilder().token(config.telegram.bot_token).build()
     application.add_handler(CallbackQueryHandler(handle_provider_button, pattern=r"^provider:"))
