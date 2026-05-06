@@ -36,6 +36,7 @@ from ai_review.cli import (
     run_gemini,
     run_ai_provider,
     run_review_for_bot_result,
+    run,
     validate_comments,
 )
 
@@ -142,8 +143,6 @@ class CliTests(unittest.TestCase):
 
         def fake_run(cmd: list[str], **_kwargs):
             commands.append(cmd)
-            if cmd[:3] == ["mcporter", "list", "jira"]:
-                raise SystemExit("Unknown MCP server 'jira'.")
             return '{"ok": true}'
 
         output = jira_client.mcporter_call(
@@ -155,11 +154,54 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertIn('"ok": true', output)
-        self.assertEqual(commands[0], ["mcporter", "list", "jira"])
-        self.assertIn("--stdio", commands[1])
-        self.assertIn("npx", commands[1])
-        self.assertIn("mcp-remote@latest", commands[1])
-        self.assertIn("https://mcp.atlassian.com/v1/mcp", commands[1])
+        self.assertEqual(commands[0][0:2], ["mcporter", "call"])
+        self.assertIn("--stdio", commands[0])
+        self.assertIn("npx", commands[0])
+        self.assertIn("mcp-remote@latest", commands[0])
+        self.assertIn("https://mcp.atlassian.com/v1/mcp", commands[0])
+
+    def test_mcporter_call_raises_when_tool_returns_is_error_payload(self):
+        def fake_run(_cmd: list[str], **_kwargs):
+            return "{ content: [ { type: 'text', text: 'MCP error -32602: Tool get_issue not found' } ], isError: true }"
+
+        with self.assertRaises(SystemExit) as caught:
+            jira_client.mcporter_call(
+                "jira.get_issue",
+                {"issueKey": "ABC-123"},
+                60000,
+                run_cmd=fake_run,
+                status_cb=lambda _msg, _detail=None: None,
+            )
+
+        self.assertIn("Tool get_issue not found", str(caught.exception))
+
+    def test_fetch_jira_tool_context_adds_cloud_id_for_get_jira_issue(self):
+        auth_var = ContextVar("auth_var", default=None)
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def fake_call_tool(selector: str, args: dict[str, object], _timeout: int) -> str:
+            calls.append((selector, args))
+            if selector == "jira.getJiraIssue":
+                return json.dumps({"fields": {"summary": "Issue summary"}})
+            raise AssertionError(f"Unexpected selector {selector}")
+
+        with patch("ai_review.jira.jira_cloud_id", return_value="cloud-1"):
+            context = jira_client.fetch_jira_tool_context(
+                "Issue",
+                "jira.getJiraIssue",
+                "issueIdOrKey",
+                "ABC-123",
+                60000,
+                run_cmd=lambda *_args, **_kwargs: "",
+                status_cb=lambda _msg, _detail=None: None,
+                auth_handler_var=auth_var,
+                call_tool=fake_call_tool,
+                auth_func=lambda _server, _timeout: None,
+            )
+
+        self.assertIn("Issue summary", context)
+        self.assertEqual(calls[0][1]["cloudId"], "cloud-1")
+        self.assertEqual(calls[0][1]["issueIdOrKey"], "ABC-123")
 
     def test_jira_context_raises_clear_error_when_jira_mcp_unavailable(self):
         auth_var = ContextVar("auth_var", default=None)
@@ -179,6 +221,30 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertIn("Jira MCP is unavailable", str(caught.exception))
+
+    def test_jira_context_logs_issue_title_when_available(self):
+        auth_var = ContextVar("auth_var", default=None)
+        statuses: list[tuple[str, str | None]] = []
+
+        context = jira_client.fetch_jira_tool_context(
+            "Issue",
+            "jira.get_issue",
+            "issueKey",
+            "ABC-123",
+            60000,
+            run_cmd=lambda *_args, **_kwargs: "",
+            status_cb=lambda message, detail=None: statuses.append((message, detail)),
+            auth_handler_var=auth_var,
+            call_tool=lambda *_args, **_kwargs: json.dumps({"fields": {"summary": "Fix login redirect loop"}}),
+            auth_func=lambda _server, _timeout: None,
+        )
+
+        self.assertIn("Fix login redirect loop", context)
+        self.assertIn(("Loaded Jira issue title", "Fix login redirect loop"), statuses)
+
+    def test_jira_issue_title_from_non_json_raw(self):
+        raw = "{ content: [ { text: 'ok' } ], issue: { summary: 'Backfill records to avoid duplicates' } }"
+        self.assertEqual(jira_client.jira_issue_title_from_raw(raw), "Backfill records to avoid duplicates")
 
     def test_config_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -787,6 +853,29 @@ smart_review = yes
 
         self.assertEqual(raw, '{"summary":"ok"}')
         claude_mock.assert_called_once()
+
+    def test_run_mcporter_cleans_up_process_group(self):
+        process = type("Proc", (), {})()
+        process.pid = 43210
+        process.returncode = 0
+        process.communicate = lambda input=None: ('{"ok":true}', "")
+
+        with patch("ai_review.cli.subprocess.Popen", return_value=process) as popen_mock, patch(
+            "ai_review.cli.os.killpg"
+        ) as killpg_mock:
+            output = run(["mcporter", "call", "jira.getJiraIssue"])
+
+        self.assertEqual(output, '{"ok":true}')
+        self.assertTrue(popen_mock.called)
+        killpg_mock.assert_called_once()
+
+    def test_run_non_mcporter_does_not_call_killpg(self):
+        with patch("ai_review.cli.subprocess.run") as run_mock, patch("ai_review.cli.os.killpg") as killpg_mock:
+            run_mock.return_value = type("Done", (), {"stdout": "ok"})()
+            output = run(["git", "--version"])
+
+        self.assertEqual(output, "ok")
+        killpg_mock.assert_not_called()
 
     def test_main_skips_checkout_when_smart_review_is_disabled(self):
         pr = PullRequest(

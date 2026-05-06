@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -37,10 +38,10 @@ DEFAULT_MAX_COMMENTS = 20
 SUPPORTED_AI_PROVIDERS = {"claude", "codex", "cursor", "gemini"}
 DEFAULT_JIRA_ENABLED = False
 DEFAULT_JIRA_MCP_SERVER = "jira"
-DEFAULT_JIRA_ISSUE_TOOL = "jira.get_issue"
-DEFAULT_JIRA_ISSUE_ARG = "issueKey"
-DEFAULT_JIRA_COMMENTS_TOOL = "jira.get_comments"
-DEFAULT_JIRA_ATTACHMENTS_TOOL = "jira.get_attachments"
+DEFAULT_JIRA_ISSUE_TOOL = "jira.getJiraIssue"
+DEFAULT_JIRA_ISSUE_ARG = "issueIdOrKey"
+DEFAULT_JIRA_COMMENTS_TOOL = "jira.getJiraIssue"
+DEFAULT_JIRA_ATTACHMENTS_TOOL = "jira.getJiraIssue"
 DEFAULT_TELEGRAM_AUTHORIZED_USER_ID = ""
 DEFAULT_TELEGRAM_BOT_TOKEN = ""
 DEFAULT_TELEGRAM_JIRA_AUTH_VIA_TELEGRAM = False
@@ -166,6 +167,8 @@ def run(
     input_text: str | None = None,
     env: dict[str, str] | None = None,
 ) -> str:
+    if cmd and cmd[0] == "mcporter":
+        return run_mcporter_with_cleanup(cmd, cwd=cwd, input_text=input_text, env=env)
     try:
         completed = subprocess.run(
             cmd,
@@ -185,6 +188,40 @@ def run(
         detail = stderr or stdout or f"exit code {exc.returncode}"
         raise SystemExit(f"Command failed: {' '.join(cmd)}\n{detail}") from exc
     return completed.stdout
+
+
+def run_mcporter_with_cleanup(
+    cmd: list[str],
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    try:
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            text=True,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Missing required executable: {cmd[0]}") from exc
+
+    try:
+        stdout, stderr = process.communicate(input=input_text)
+        if process.returncode != 0:
+            detail = (stderr or "").strip() or (stdout or "").strip() or f"exit code {process.returncode}"
+            raise SystemExit(f"Command failed: {' '.join(cmd)}\n{detail}")
+        return stdout
+    finally:
+        # Ensure no MCP child processes are left behind after each mcporter call.
+        if process.pid is None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
 
 
 def run_streaming(cmd: list[str], cwd: Path | None = None) -> str:
