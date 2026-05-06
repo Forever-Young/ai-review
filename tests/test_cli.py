@@ -3,9 +3,11 @@ import configparser
 import tempfile
 import unittest
 from argparse import Namespace
+from contextvars import ContextVar
 from pathlib import Path
 from unittest.mock import call, patch
 
+from ai_review import jira as jira_client
 from ai_review.cli import (
     DEFAULT_CACHE_DIR,
     DEFAULT_CONFIG_FILE,
@@ -134,6 +136,49 @@ class CliTests(unittest.TestCase):
         self.assertIn('{"ok": true}', context)
         self.assertEqual(call_mock.call_count, 2)
         auth_mock.assert_called_once()
+
+    def test_mcporter_call_uses_jira_remote_fallback_when_server_missing(self):
+        commands: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs):
+            commands.append(cmd)
+            if cmd[:3] == ["mcporter", "list", "jira"]:
+                raise SystemExit("Unknown MCP server 'jira'.")
+            return '{"ok": true}'
+
+        output = jira_client.mcporter_call(
+            "jira.get_issue",
+            {"issueKey": "ABC-123"},
+            60000,
+            run_cmd=fake_run,
+            status_cb=lambda _msg, _detail=None: None,
+        )
+
+        self.assertIn('"ok": true', output)
+        self.assertEqual(commands[0], ["mcporter", "list", "jira"])
+        self.assertIn("--stdio", commands[1])
+        self.assertIn("npx", commands[1])
+        self.assertIn("mcp-remote@latest", commands[1])
+        self.assertIn("https://mcp.atlassian.com/v1/mcp", commands[1])
+
+    def test_jira_context_raises_clear_error_when_jira_mcp_unavailable(self):
+        auth_var = ContextVar("auth_var", default=None)
+
+        with self.assertRaises(SystemExit) as caught:
+            jira_client.fetch_jira_tool_context(
+                "Issue",
+                "jira.get_issue",
+                "issueKey",
+                "ABC-123",
+                60000,
+                run_cmd=lambda *_args, **_kwargs: "",
+                status_cb=lambda _msg, _detail=None: None,
+                auth_handler_var=auth_var,
+                call_tool=lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit("Unknown MCP server 'jira'.")),
+                auth_func=lambda _server, _timeout: None,
+            )
+
+        self.assertIn("Jira MCP is unavailable", str(caught.exception))
 
     def test_config_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:
