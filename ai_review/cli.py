@@ -21,6 +21,7 @@ DEFAULT_CONFIG_FILE = Path("~/.config/ai-review/ai-review.conf").expanduser()
 DEFAULT_CACHE_DIR = Path("~/.local/cache/ai-review").expanduser()
 DEFAULT_AI_PROVIDER = "codex"
 DEFAULT_PUBLISH_PENDING = True
+DEFAULT_SMART_REVIEW = False
 SUPPORTED_AI_PROVIDERS = {"codex"}
 DEFAULT_JIRA_ENABLED = False
 DEFAULT_JIRA_MCP_SERVER = "jira"
@@ -116,6 +117,7 @@ class AppConfig:
     codex_model: str | None
     github_token: str | None
     publish_pending: bool
+    smart_review: bool
     max_comments: int
     save_prompt: Path | None
     jira: JiraConfig
@@ -217,6 +219,9 @@ def create_default_config_file(path: Path, args: argparse.Namespace) -> None:
     }
     parser["review"] = {
         "max_comments": str(args.max_comments if args.max_comments is not None else 20),
+        "smart_review": bool_config_value(
+            args.smart_review if args.smart_review is not None else DEFAULT_SMART_REVIEW
+        ),
     }
     if args.save_prompt:
         parser["review"]["save_prompt"] = args.save_prompt
@@ -261,6 +266,13 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     if args.publish_pending is not None:
         publish_pending = args.publish_pending
 
+    smart_review = DEFAULT_SMART_REVIEW
+    configured_smart_review = config_get(parser, "review", "smart_review")
+    if configured_smart_review is not None:
+        smart_review = parse_bool(configured_smart_review)
+    if args.smart_review is not None:
+        smart_review = args.smart_review
+
     ai_provider = ai_provider.strip().lower()
     if ai_provider not in SUPPORTED_AI_PROVIDERS:
         supported = ", ".join(sorted(SUPPORTED_AI_PROVIDERS))
@@ -285,6 +297,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         codex_model=codex_model,
         github_token=github_token,
         publish_pending=publish_pending,
+        smart_review=smart_review,
         max_comments=max_comments,
         save_prompt=expand_path(save_prompt_raw) if save_prompt_raw else None,
         jira=jira,
@@ -371,6 +384,73 @@ def load_first_pr_comment(ref: PullRequestRef, github_token: str | None = None) 
     return data[0].get("body") or ""
 
 
+def load_paginated_gh_api(path: str, github_token: str | None = None) -> list[Any]:
+    items: list[Any] = []
+    separator = "&" if "?" in path else "?"
+    page = 1
+    while True:
+        raw = gh_api(f"{path}{separator}per_page=100&page={page}", github_token=github_token)
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise SystemExit(f"Expected GitHub API list response for {path}.")
+        items.extend(data)
+        if len(data) < 100:
+            return items
+        page += 1
+
+
+def trim_pull_request_context(value: str) -> str:
+    if len(value) <= MAX_CONTEXT_CHARS:
+        return value
+    return value[:MAX_CONTEXT_CHARS] + "\n\n[PR discussion context truncated by ai-review]\n"
+
+
+def load_pr_discussion_context(ref: PullRequestRef, github_token: str | None = None) -> str:
+    status("Loading pull request discussion")
+    parts: list[str] = []
+
+    issue_comments = load_paginated_gh_api(
+        f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments",
+        github_token=github_token,
+    )
+    for item in issue_comments:
+        body = str(item.get("body") or "").strip()
+        if not body:
+            continue
+        user = (item.get("user") or {}).get("login") or "unknown"
+        created_at = item.get("created_at") or "unknown time"
+        parts.append(f"PR conversation comment by {user} at {created_at}:\n{body}\n")
+
+    reviews = load_paginated_gh_api(
+        f"repos/{ref.owner}/{ref.repo}/pulls/{ref.number}/reviews",
+        github_token=github_token,
+    )
+    for item in reviews:
+        body = str(item.get("body") or "").strip()
+        if not body:
+            continue
+        user = (item.get("user") or {}).get("login") or "unknown"
+        state = item.get("state") or "UNKNOWN"
+        submitted_at = item.get("submitted_at") or item.get("created_at") or "unknown time"
+        parts.append(f"PR review {state} by {user} at {submitted_at}:\n{body}\n")
+
+    review_comments = load_paginated_gh_api(
+        f"repos/{ref.owner}/{ref.repo}/pulls/{ref.number}/comments",
+        github_token=github_token,
+    )
+    for item in review_comments:
+        body = str(item.get("body") or "").strip()
+        if not body:
+            continue
+        user = (item.get("user") or {}).get("login") or "unknown"
+        path = item.get("path") or "unknown file"
+        line = item.get("line") or item.get("original_line") or "unknown line"
+        created_at = item.get("created_at") or "unknown time"
+        parts.append(f"Inline review comment by {user} at {created_at} on {path}:{line}:\n{body}\n")
+
+    return trim_pull_request_context("\n".join(parts)) if parts else "No existing PR comments or review comments were found."
+
+
 def ensure_checkout(pr: PullRequest, cache_dir: Path, git_ssh_command: str | None = None) -> Path:
     repos_dir = cache_dir / "repos"
     worktrees_dir = cache_dir / "worktrees"
@@ -450,12 +530,30 @@ def changed_right_lines(diff: str) -> dict[str, set[int]]:
     return changed
 
 
-def build_prompt(pr: PullRequest, diff: str, jira_context: str | None) -> str:
+def build_prompt(
+    pr: PullRequest,
+    diff: str,
+    jira_context: str | None,
+    pr_discussion_context: str,
+    smart_review: bool,
+) -> str:
     trimmed_diff = diff
     if len(trimmed_diff) > MAX_DIFF_CHARS:
         trimmed_diff = diff[:MAX_DIFF_CHARS] + "\n\n[Diff truncated by ai-review]\n"
 
     jira_section = jira_context or "No Jira context was loaded."
+    context_rule = (
+        "Smart review is enabled. Start from the supplied PR metadata, existing PR discussion, Jira context, and "
+        "unified diff. Inspect checked-out project files only as a targeted fallback when the diff leaves an "
+        "important correctness, security, data-loss, concurrency, migration, API contract, or test-gap question "
+        "unclear. Prefer reading the smallest directly related files, such as changed files and immediate callers "
+        "or callees. Do not scan the whole project, run broad searches without a concrete question, write files, or "
+        "ask for permissions."
+        if smart_review
+        else "Smart review is disabled. Strictly use only the PR metadata, existing PR discussion, Jira context, "
+        "and unified diff supplied in this prompt. Do not use repository files or infer from context that is not "
+        "included below."
+    )
 
     return textwrap.dedent(
         f"""
@@ -479,6 +577,7 @@ def build_prompt(pr: PullRequest, diff: str, jira_context: str | None) -> str:
         }}
 
         Rules:
+        - {context_rule}
         - Only comment on added or changed RIGHT-side lines present in the diff.
         - Each body must explain the risk and the change needed.
         - Prefer no comment over a speculative comment.
@@ -492,6 +591,9 @@ def build_prompt(pr: PullRequest, diff: str, jira_context: str | None) -> str:
         Title: {pr.title}
         Body:
         {pr.body}
+
+        Existing PR discussion, comments, and reviews:
+        {pr_discussion_context}
 
         Jira context:
         {jira_section}
@@ -540,9 +642,9 @@ def extract_ticket_key_heuristic(pr: PullRequest, first_comment: str) -> str | N
     return None
 
 
-def extract_ticket_key_with_codex(pr: PullRequest, first_comment: str, checkout: Path, model: str | None) -> str | None:
+def extract_ticket_key_with_codex(pr: PullRequest, first_comment: str, model: str | None) -> str | None:
     status("Asking Codex to identify Jira ticket")
-    raw = run_codex(build_ticket_extraction_prompt(pr, first_comment), checkout, model)
+    raw = run_codex(build_ticket_extraction_prompt(pr, first_comment), None, model)
     try:
         data = json.loads(raw.strip())
     except json.JSONDecodeError:
@@ -554,10 +656,8 @@ def extract_ticket_key_with_codex(pr: PullRequest, first_comment: str, checkout:
     return match.group(1) if match else None
 
 
-def extract_ticket_key(pr: PullRequest, first_comment: str, checkout: Path, model: str | None) -> str | None:
-    return extract_ticket_key_with_codex(pr, first_comment, checkout, model) or extract_ticket_key_heuristic(
-        pr, first_comment
-    )
+def extract_ticket_key(pr: PullRequest, first_comment: str, model: str | None) -> str | None:
+    return extract_ticket_key_with_codex(pr, first_comment, model) or extract_ticket_key_heuristic(pr, first_comment)
 
 
 def mcporter_auth(server: str, timeout_ms: int) -> None:
@@ -611,12 +711,12 @@ def fetch_jira_tool_context(label: str, selector: str | None, issue_arg: str, ti
     return f"{label} ({selector}):\n{raw}\n"
 
 
-def load_jira_context(config: JiraConfig, pr: PullRequest, first_comment: str, checkout: Path, model: str | None) -> str | None:
+def load_jira_context(config: JiraConfig, pr: PullRequest, first_comment: str, model: str | None) -> str | None:
     if not config.enabled:
         status("Skipping Jira context", "disabled")
         return None
     status("Checking Jira context")
-    ticket_key = extract_ticket_key(pr, first_comment, checkout, model)
+    ticket_key = extract_ticket_key(pr, first_comment, model)
     if not ticket_key:
         status("No Jira ticket key found")
         return "Jira was enabled, but no ticket key could be extracted from the branch, PR title, PR body, or first PR comment."
@@ -641,14 +741,19 @@ def load_jira_context(config: JiraConfig, pr: PullRequest, first_comment: str, c
     return trim_context("\n".join(part for part in parts if part))
 
 
-def run_codex(prompt: str, checkout: Path, model: str | None) -> str:
+def run_codex(prompt: str, cwd: Path | None, model: str | None) -> str:
     with tempfile.TemporaryDirectory(prefix="ai-review-codex-") as temp_dir:
+        if cwd is None:
+            cwd = Path(temp_dir) / "empty-workspace"
+            cwd.mkdir()
         output_file = Path(temp_dir) / "review.json"
         cmd = [
             "codex",
             "exec",
+            "--config",
+            'approval_policy="never"',
             "-C",
-            str(checkout),
+            str(cwd),
             "--sandbox",
             "read-only",
             "--output-last-message",
@@ -840,6 +945,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-comments", type=int, help="Maximum inline comments to keep.")
     parser.add_argument(
+        "--smart-review",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow the AI reviewer to read files from the checked-out PR worktree for extra context.",
+    )
+    parser.add_argument(
         "--save-prompt",
         help="Write the generated reviewer prompt to this file.",
     )
@@ -871,26 +982,28 @@ def main(argv: list[str] | None = None) -> int:
     status("Loading pull request", f"{ref.owner}/{ref.repo}#{ref.number}")
     pr = load_pr(ref, config.github_token)
 
-    checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
-    if config.jira.enabled:
-        status("Loading first PR comment for Jira ticket detection")
+    pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
     first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
-    jira_context = load_jira_context(config.jira, pr, first_comment, checkout, config.codex_model)
+    jira_context = load_jira_context(config.jira, pr, first_comment, config.codex_model)
     status("Loading pull request diff")
     diff = load_diff(ref, config.github_token)
     status("Building review prompt")
-    prompt = build_prompt(pr, diff, jira_context)
+    prompt = build_prompt(pr, diff, jira_context, pr_discussion_context, config.smart_review)
     if config.save_prompt:
         status("Saving review prompt", str(config.save_prompt))
         config.save_prompt.parent.mkdir(parents=True, exist_ok=True)
         config.save_prompt.write_text(prompt, encoding="utf-8")
 
+    checkout: Path | None = None
+    if config.smart_review:
+        checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
     raw_review = run_codex(prompt, checkout, config.codex_model)
     status("Validating reviewer findings")
     review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
 
-    print(f"Checked out PR head at: {checkout}")
-    print()
+    if checkout:
+        print(f"Checked out PR head at: {checkout}")
+        print()
     print_review(review)
 
     if config.publish_pending:

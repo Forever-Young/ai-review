@@ -10,9 +10,11 @@ from ai_review.cli import (
     DEFAULT_CACHE_DIR,
     DEFAULT_CONFIG_FILE,
     DEFAULT_PUBLISH_PENDING,
+    DEFAULT_SMART_REVIEW,
     PullRequest,
     PullRequestRef,
     build_config,
+    build_prompt,
     build_review_body,
     changed_right_lines,
     create_or_replace_pending_review,
@@ -23,9 +25,11 @@ from ai_review.cli import (
     git_ssh_command_from_key,
     ensure_checkout,
     is_auth_error,
+    load_pr_discussion_context,
     main,
     parse_pr_url,
     parse_review,
+    run_codex,
     validate_comments,
 )
 
@@ -139,6 +143,7 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(config.codex_model)
         self.assertIsNone(config.github_token)
         self.assertEqual(config.publish_pending, DEFAULT_PUBLISH_PENDING)
+        self.assertEqual(config.smart_review, DEFAULT_SMART_REVIEW)
         self.assertEqual(config.max_comments, 20)
 
     def test_missing_config_file_is_created_with_defaults(self):
@@ -157,6 +162,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parser.get("codex", "model"), "")
         self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("review", "max_comments"), "20")
+        self.assertEqual(parser.get("review", "smart_review"), "no")
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
         self.assertEqual(parser.get("github", "token"), "")
 
@@ -171,6 +177,7 @@ class CliTests(unittest.TestCase):
                     ai_provider="codex",
                     codex_model="gpt-5.2",
                     publish_pending=True,
+                    smart_review=True,
                     max_comments=11,
                     save_prompt="/tmp/prompt.txt",
                 )
@@ -182,6 +189,7 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(config.git_ssh_command)
         self.assertEqual(config.codex_model, "gpt-5.2")
         self.assertTrue(config.publish_pending)
+        self.assertTrue(config.smart_review)
         self.assertEqual(config.max_comments, 11)
         self.assertEqual(parser.get("git", "cache_dir"), "/tmp/review-cache")
         self.assertEqual(parser.get("git", "ssh_key_path"), "")
@@ -189,6 +197,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parser.get("codex", "model"), "gpt-5.2")
         self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("review", "max_comments"), "11")
+        self.assertEqual(parser.get("review", "smart_review"), "yes")
         self.assertEqual(parser.get("review", "save_prompt"), "/tmp/prompt.txt")
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
 
@@ -213,6 +222,7 @@ token = ghp_example
 
 [review]
 max_comments = 7
+smart_review = yes
 save_prompt = ~/review-prompt.txt
 """.strip(),
                 encoding="utf-8",
@@ -226,6 +236,7 @@ save_prompt = ~/review-prompt.txt
         self.assertEqual(config.codex_model, "gpt-5.2")
         self.assertEqual(config.github_token, "ghp_example")
         self.assertTrue(config.publish_pending)
+        self.assertTrue(config.smart_review)
         self.assertEqual(config.max_comments, 7)
         self.assertEqual(config.save_prompt, Path("~/review-prompt.txt").expanduser())
 
@@ -481,6 +492,9 @@ provider = codex
 
 [github]
 publish_pending = yes
+
+[review]
+smart_review = yes
 """.strip(),
                 encoding="utf-8",
             )
@@ -492,6 +506,7 @@ publish_pending = yes
                     ai_provider="codex",
                     codex_model="gpt-5.2",
                     publish_pending=False,
+                    smart_review=False,
                     max_comments=3,
                 )
             )
@@ -500,7 +515,176 @@ publish_pending = yes
         self.assertEqual(config.ai_provider, "codex")
         self.assertEqual(config.codex_model, "gpt-5.2")
         self.assertFalse(config.publish_pending)
+        self.assertFalse(config.smart_review)
         self.assertEqual(config.max_comments, 3)
+
+    def test_load_pr_discussion_context_includes_issue_reviews_and_inline_comments(self):
+        ref = PullRequestRef("example", "project", 42)
+
+        with patch(
+            "ai_review.cli.gh_api",
+            side_effect=[
+                json.dumps(
+                    [
+                        {
+                            "body": "author follow-up",
+                            "user": {"login": "author"},
+                            "created_at": "2026-01-01T00:00:00Z",
+                        }
+                    ]
+                ),
+                json.dumps(
+                    [
+                        {
+                            "body": "request changes summary",
+                            "state": "CHANGES_REQUESTED",
+                            "user": {"login": "reviewer"},
+                            "submitted_at": "2026-01-02T00:00:00Z",
+                        }
+                    ]
+                ),
+                json.dumps(
+                    [
+                        {
+                            "body": "inline concern",
+                            "path": "app.py",
+                            "line": 12,
+                            "user": {"login": "reviewer"},
+                            "created_at": "2026-01-02T00:01:00Z",
+                        }
+                    ]
+                ),
+            ],
+        ):
+            context = load_pr_discussion_context(ref)
+
+        self.assertIn("author follow-up", context)
+        self.assertIn("request changes summary", context)
+        self.assertIn("inline concern", context)
+        self.assertIn("app.py:12", context)
+
+    def test_build_prompt_includes_pr_discussion_and_non_smart_rule(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Fix checkout",
+            body="PR body",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+
+        prompt = build_prompt(pr, "diff --git a/app.py b/app.py", None, "existing review context", False)
+
+        self.assertIn("Smart review is disabled", prompt)
+        self.assertIn("existing review context", prompt)
+        self.assertIn("Strictly use only the PR metadata", prompt)
+
+    def test_build_prompt_allows_file_context_in_smart_mode(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Fix checkout",
+            body="PR body",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+
+        prompt = build_prompt(pr, "diff --git a/app.py b/app.py", None, "existing review context", True)
+
+        self.assertIn("Smart review is enabled", prompt)
+        self.assertIn("Inspect checked-out project files", prompt)
+        self.assertIn("smallest directly related files", prompt)
+        self.assertIn("targeted fallback", prompt)
+        self.assertIn("Do not scan the whole project", prompt)
+
+    def test_run_codex_disables_approval_prompts_and_uses_empty_workspace_without_cwd(self):
+        with patch("ai_review.cli.run", return_value='{"summary": "ok"}') as run_mock:
+            raw = run_codex("prompt", None, "gpt-5.2")
+
+        self.assertEqual(raw, '{"summary": "ok"}')
+        cmd = run_mock.call_args.args[0]
+        self.assertIn("--config", cmd)
+        self.assertIn('approval_policy="never"', cmd)
+        self.assertIn("--sandbox", cmd)
+        self.assertIn("read-only", cmd)
+        cwd = Path(cmd[cmd.index("-C") + 1])
+        self.assertEqual(cwd.name, "empty-workspace")
+
+    def test_main_skips_checkout_when_smart_review_is_disabled(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Fix checkout",
+            body="PR body",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("ai_review.cli.load_pr", return_value=pr), patch(
+                "ai_review.cli.load_pr_discussion_context", return_value="No comments."
+            ), patch("ai_review.cli.load_jira_context", return_value=None), patch(
+                "ai_review.cli.load_diff", return_value="diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+            ), patch("ai_review.cli.ensure_checkout") as checkout_mock, patch(
+                "ai_review.cli.run_codex", return_value='{"summary": "ok", "comments": []}'
+            ), patch(
+                "ai_review.cli.create_or_replace_pending_review"
+            ):
+                main(
+                    [
+                        "--config-file",
+                        str(Path(temp_dir) / "ai-review.conf"),
+                        "--no-publish-pending",
+                        "https://github.com/example/project/pull/42",
+                    ]
+                )
+
+        checkout_mock.assert_not_called()
+
+    def test_main_checks_out_when_smart_review_is_enabled(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Fix checkout",
+            body="PR body",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkout = Path(temp_dir) / "checkout"
+            with patch("ai_review.cli.load_pr", return_value=pr), patch(
+                "ai_review.cli.load_pr_discussion_context", return_value="No comments."
+            ), patch("ai_review.cli.load_jira_context", return_value=None), patch(
+                "ai_review.cli.load_diff", return_value="diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+            ), patch("ai_review.cli.ensure_checkout", return_value=checkout) as checkout_mock, patch(
+                "ai_review.cli.run_codex", return_value='{"summary": "ok", "comments": []}'
+            ), patch(
+                "ai_review.cli.create_or_replace_pending_review"
+            ):
+                main(
+                    [
+                        "--config-file",
+                        str(Path(temp_dir) / "ai-review.conf"),
+                        "--no-publish-pending",
+                        "--smart-review",
+                        "https://github.com/example/project/pull/42",
+                    ]
+                )
+
+        checkout_mock.assert_called_once()
 
     def test_rejects_unknown_ai_provider(self):
         with self.assertRaises(SystemExit):
@@ -527,6 +711,7 @@ publish_pending = yes
         self.assertEqual(parser.get("codex", "model"), "")
         self.assertEqual(parser.get("git", "cache_dir"), str(DEFAULT_CACHE_DIR))
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
+        self.assertEqual(parser.get("review", "smart_review"), "no")
 
     def args(self, **overrides):
         values = {
@@ -537,6 +722,7 @@ publish_pending = yes
             "publish_pending": None,
             "max_comments": None,
             "save_prompt": None,
+            "smart_review": None,
             "jira_enabled": None,
             "jira_auth": False,
         }

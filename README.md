@@ -2,10 +2,13 @@
 
 CLI for running an AI review against a GitHub pull request URL.
 
-It caches repositories under `~/.local/cache/ai-review/` by default, checks out the PR
-head into a reusable worktree, asks an AI reviewer for inline findings, and can
-create a GitHub pending review. Pending review comments are visible only as your
-unsubmitted review draft until you submit them in GitHub.
+It loads pull request metadata, existing PR discussion, review comments, and
+the PR diff through `gh`, asks an AI reviewer for inline findings, and can
+create a GitHub pending review. When smart review is enabled, it also caches
+repositories under `~/.local/cache/ai-review/` and checks out the PR head into a
+reusable read-only worktree for extra review context. Pending review comments
+are visible only as your unsubmitted review draft until you submit them in
+GitHub.
 
 ## Requirements
 
@@ -65,6 +68,7 @@ model =
 
 [review]
 max_comments = 20
+smart_review = no
 save_prompt = ~/tmp/ai-review-prompt.txt
 
 [github]
@@ -80,6 +84,16 @@ enabled = no
 model.
 
 CLI arguments override the config file.
+
+`smart_review = no` keeps review generation limited to the PR title, PR body,
+existing PR conversation comments, existing review comments, optional Jira
+context, and the unified diff. In this mode the Codex reviewer runs from an
+empty workspace, so repository files are not available to inspect. Set
+`smart_review = yes` or pass `--smart-review` to let Codex read files from the
+checked-out PR worktree when the diff leaves an important review question
+unclear. Smart review asks Codex to use file reads as a targeted fallback, not
+as a whole-project investigation, and still runs with a read-only sandbox and
+disabled approval prompts.
 
 Set `git.ssh_key_path` when repository mirrors should be cloned and fetched
 over SSH with a specific key. When this is set, `ai-review` uses GitHub's SSH
@@ -171,6 +185,12 @@ Use a specific Codex model:
 
 ```sh
 ai-review https://github.com/OWNER/REPO/pull/123 --codex-model gpt-5.2
+```
+
+Allow Codex to inspect checked-out project files as read-only review context:
+
+```sh
+ai-review https://github.com/OWNER/REPO/pull/123 --smart-review
 ```
 
 ## Safety
