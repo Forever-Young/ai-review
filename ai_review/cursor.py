@@ -8,6 +8,7 @@ from typing import Callable
 def run_cursor(
     prompt: str,
     cwd: Path | None,
+    model: str | None,
     *,
     run_cmd: Callable[..., str],
     status_cb: Callable[[str, str | None], None],
@@ -16,5 +17,8 @@ def run_cursor(
         if cwd is None:
             cwd = Path(temp_dir) / "empty-workspace"
             cwd.mkdir()
-        status_cb("Running Cursor reviewer", None)
-        return run_cmd(["cursor"], cwd=cwd, input_text=prompt)
+        cmd = ["cursor"]
+        if model:
+            cmd.extend(["--model", model])
+        status_cb("Running Cursor reviewer", f"model {model}" if model else None)
+        return run_cmd(cmd, cwd=cwd, input_text=prompt)

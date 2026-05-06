@@ -18,7 +18,10 @@ GitHub.
   or configured with a token in `ai-review.conf`
 - For posting pending review comments: the GitHub token or `gh` login needs
   pull request write access
-- `codex` CLI logged in and usable non-interactively
+- one AI provider CLI logged in and usable non-interactively:
+  - `codex`
+  - `cursor`
+  - `gemini`
 
 ## Install
 
@@ -67,6 +70,12 @@ provider = codex
 [codex]
 model =
 
+[cursor]
+model =
+
+[gemini]
+model =
+
 [review]
 max_comments = 20
 smart_review = no
@@ -85,19 +94,24 @@ authorized_user_id =
 jira_auth_via_telegram = no
 ```
 
-`provider = codex` uses the local Codex CLI for review generation. Leave
-`codex.model` blank to let the local Codex CLI choose its configured default
-model.
+`ai.provider` selects which local CLI is used for review generation:
+`codex`, `cursor`, or `gemini`.
+
+- `codex.model` maps to `codex exec --model ...`
+- `cursor.model` maps to `cursor --model ...`
+- `gemini.model` maps to `gemini --model ...`
+
+Leave provider model values blank to let each CLI use its own default.
 
 CLI arguments override the config file.
 
 `smart_review = no` keeps review generation limited to the PR title, PR body,
 existing PR conversation comments, existing review comments, optional Jira
-context, and the unified diff. In this mode the Codex reviewer runs from an
+context, and the unified diff. In this mode the selected AI provider runs from an
 empty workspace, so repository files are not available to inspect. Set
-`smart_review = yes` or pass `--smart-review` to let Codex read files from the
+`smart_review = yes` or pass `--smart-review` to let the provider read files from the
 checked-out PR worktree when the diff leaves an important review question
-unclear. Smart review asks Codex to use file reads as a targeted fallback, not
+unclear. Smart review asks the selected AI provider to use file reads as a targeted fallback, not
 as a whole-project investigation, and still runs with a read-only sandbox and
 disabled approval prompts.
 
@@ -156,7 +170,7 @@ are ignored with no reply.
 
 After authorization is configured, send the bot a GitHub PR URL. It runs the
 same review flow as the CLI using the same config file, including GitHub,
-Codex, Jira, smart review, and pending review settings. The bot edits one
+selected AI provider, Jira, smart review, and pending review settings. The bot edits one
 progress message while the review runs. On success, the final chat message is
 only the GitHub pending review link. On failure, the final chat message is the
 error instead.
@@ -240,10 +254,10 @@ browser OAuth page when cached credentials are missing or stale.
 When Jira is enabled, `ai-review` extracts a ticket key from the PR branch,
 title, body, or first PR comment. It recognizes keys like `ABC-123` and
 `ABC12-123`; comments such as `Refs: ABC-123` also work. If a simple scan cannot
-find the key, Codex is asked to extract it from the same PR metadata. It then
+find the key, the selected AI provider is asked to extract it from the same PR metadata. It then
 loads Jira issue description, comments, and attachments/images through the
 configured MCPorter Jira server and includes that context in the review prompt
-so Codex can flag PR-level gaps as well as inline code issues.
+so the provider can flag PR-level gaps as well as inline code issues.
 
 ## Usage
 
@@ -265,13 +279,15 @@ Use a custom cache directory:
 ai-review https://github.com/OWNER/REPO/pull/123 --cache-dir /path/to/review-cache
 ```
 
-Use a specific Codex model:
+Use a specific provider and model:
 
 ```sh
-ai-review https://github.com/OWNER/REPO/pull/123 --codex-model gpt-5.2
+ai-review https://github.com/OWNER/REPO/pull/123 --ai-provider codex --codex-model gpt-5.2
+ai-review https://github.com/OWNER/REPO/pull/123 --ai-provider cursor --cursor-model any-supported-cursor-model
+ai-review https://github.com/OWNER/REPO/pull/123 --ai-provider gemini --gemini-model gemini-2.5-pro
 ```
 
-Allow Codex to inspect checked-out project files as read-only review context:
+Allow the selected provider to inspect checked-out project files as read-only review context:
 
 ```sh
 ai-review https://github.com/OWNER/REPO/pull/123 --smart-review

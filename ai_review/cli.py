@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from . import codex as codex_provider
 from . import cursor as cursor_provider
+from . import gemini as gemini_provider
 from . import gh as gh_client
 from . import jira as jira_client
 
@@ -31,7 +32,7 @@ DEFAULT_AI_PROVIDER = "codex"
 DEFAULT_PUBLISH_PENDING = True
 DEFAULT_SMART_REVIEW = False
 DEFAULT_MAX_COMMENTS = 20
-SUPPORTED_AI_PROVIDERS = {"codex", "cursor"}
+SUPPORTED_AI_PROVIDERS = {"codex", "cursor", "gemini"}
 DEFAULT_JIRA_ENABLED = False
 DEFAULT_JIRA_MCP_SERVER = "jira"
 DEFAULT_JIRA_ISSUE_TOOL = "jira.get_issue"
@@ -145,6 +146,8 @@ class AppConfig:
     git_ssh_command: str | None
     ai_provider: str
     codex_model: str | None
+    cursor_model: str | None
+    gemini_model: str | None
     github_token: str | None
     publish_pending: bool
     smart_review: bool
@@ -273,6 +276,8 @@ def default_config_values(
     cache_dir = args.cache_dir if use_cli_values and args and args.cache_dir else str(DEFAULT_CACHE_DIR)
     ai_provider = args.ai_provider if use_cli_values and args and args.ai_provider else DEFAULT_AI_PROVIDER
     codex_model = args.codex_model if use_cli_values and args and args.codex_model else ""
+    cursor_model = args.cursor_model if use_cli_values and args and args.cursor_model else ""
+    gemini_model = args.gemini_model if use_cli_values and args and args.gemini_model else ""
     max_comments = (
         args.max_comments
         if use_cli_values and args and args.max_comments is not None
@@ -304,6 +309,12 @@ def default_config_values(
         },
         "codex": {
             "model": codex_model,
+        },
+        "cursor": {
+            "model": cursor_model,
+        },
+        "gemini": {
+            "model": gemini_model,
         },
         "review": {
             "max_comments": str(max_comments),
@@ -368,6 +379,8 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     git_ssh_command = config_secret_value(config_get(parser, "git", "ssh_command"))
     ai_provider = args.ai_provider or config_get(parser, "ai", "provider") or DEFAULT_AI_PROVIDER
     codex_model = blank_to_none(args.codex_model or config_get(parser, "codex", "model"))
+    cursor_model = blank_to_none(args.cursor_model or config_get(parser, "cursor", "model"))
+    gemini_model = blank_to_none(args.gemini_model or config_get(parser, "gemini", "model"))
     max_comments_raw = args.max_comments if args.max_comments is not None else config_get(parser, "review", "max_comments")
     save_prompt_raw = args.save_prompt or config_get(parser, "review", "save_prompt")
     github_token = config_secret_value(config_get(parser, "github", "token") or config_get(parser, "github", "key"))
@@ -410,6 +423,8 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         git_ssh_command=git_ssh_command,
         ai_provider=ai_provider,
         codex_model=codex_model,
+        cursor_model=cursor_model,
+        gemini_model=gemini_model,
         github_token=github_token,
         publish_pending=publish_pending,
         smart_review=smart_review,
@@ -875,7 +890,22 @@ def run_codex(prompt: str, cwd: Path | None, model: str | None) -> str:
 
 
 def run_cursor(prompt: str, cwd: Path | None) -> str:
-    return cursor_provider.run_cursor(prompt, cwd, run_cmd=run, status_cb=status)
+    return cursor_provider.run_cursor(prompt, cwd, None, run_cmd=run, status_cb=status)
+
+
+def run_gemini(prompt: str, cwd: Path | None, model: str | None) -> str:
+    return gemini_provider.run_gemini(prompt, cwd, model, run_cmd=run, status_cb=status)
+
+
+def model_for_provider(config: AppConfig, provider: str) -> str | None:
+    normalized_provider = provider.strip().lower()
+    if normalized_provider == "codex":
+        return config.codex_model
+    if normalized_provider == "cursor":
+        return config.cursor_model
+    if normalized_provider == "gemini":
+        return config.gemini_model
+    return None
 
 
 def run_ai_provider(prompt: str, cwd: Path | None, provider: str, model: str | None) -> str:
@@ -883,7 +913,9 @@ def run_ai_provider(prompt: str, cwd: Path | None, provider: str, model: str | N
     if normalized_provider == "codex":
         return run_codex(prompt, cwd, model)
     if normalized_provider == "cursor":
-        return run_cursor(prompt, cwd)
+        return cursor_provider.run_cursor(prompt, cwd, model, run_cmd=run, status_cb=status)
+    if normalized_provider == "gemini":
+        return run_gemini(prompt, cwd, model)
     supported = ", ".join(sorted(SUPPORTED_AI_PROVIDERS))
     raise SystemExit(f"Unsupported AI provider {provider!r}. Supported providers: {supported}.")
 
@@ -1050,7 +1082,8 @@ def run_review_command(args: argparse.Namespace, config: AppConfig) -> int:
 
     pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
     first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
-    jira_context = load_jira_context(config.jira, pr, first_comment, config.ai_provider, config.codex_model)
+    provider_model = model_for_provider(config, config.ai_provider)
+    jira_context = load_jira_context(config.jira, pr, first_comment, config.ai_provider, provider_model)
     status("Loading pull request diff")
     diff = load_diff(ref, config.github_token)
     status("Building review prompt")
@@ -1063,7 +1096,7 @@ def run_review_command(args: argparse.Namespace, config: AppConfig) -> int:
     checkout: Path | None = None
     if config.smart_review:
         checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
-    raw_review = run_ai_provider(prompt, checkout, config.ai_provider, config.codex_model)
+    raw_review = run_ai_provider(prompt, checkout, config.ai_provider, provider_model)
     status("Validating reviewer findings")
     review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
 
@@ -1120,7 +1153,8 @@ def run_review_to_pending_review_url(pr_url: str, config: AppConfig) -> str:
 
     pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
     first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
-    jira_context = load_jira_context(config.jira, pr, first_comment, config.ai_provider, config.codex_model)
+    provider_model = model_for_provider(config, config.ai_provider)
+    jira_context = load_jira_context(config.jira, pr, first_comment, config.ai_provider, provider_model)
     status("Loading pull request diff")
     diff = load_diff(ref, config.github_token)
     status("Building review prompt")
@@ -1133,7 +1167,7 @@ def run_review_to_pending_review_url(pr_url: str, config: AppConfig) -> str:
     checkout: Path | None = None
     if config.smart_review:
         checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
-    raw_review = run_ai_provider(prompt, checkout, config.ai_provider, config.codex_model)
+    raw_review = run_ai_provider(prompt, checkout, config.ai_provider, provider_model)
     status("Validating reviewer findings")
     review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
     if not review.comments and not review.pr_comments and not review.summary:
@@ -1258,9 +1292,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ai-provider",
         choices=sorted(SUPPORTED_AI_PROVIDERS),
-        help="AI provider type to use. Defaults to codex. Supported: codex, cursor.",
+        help="AI provider type to use. Defaults to codex. Supported: codex, cursor, gemini.",
     )
     parser.add_argument("--codex-model", help="Optional model passed to `codex exec --model` (codex provider only).")
+    parser.add_argument("--cursor-model", help="Optional model passed to `cursor --model` (cursor provider only).")
+    parser.add_argument("--gemini-model", help="Optional model passed to `gemini --model` (gemini provider only).")
     parser.add_argument(
         "--publish-pending",
         action=argparse.BooleanOptionalAction,

@@ -31,6 +31,7 @@ from ai_review.cli import (
     parse_review,
     run_codex,
     run_cursor,
+    run_gemini,
     run_review_for_bot_result,
     validate_comments,
 )
@@ -143,6 +144,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.config_file, config_path)
         self.assertEqual(config.ai_provider, "codex")
         self.assertIsNone(config.codex_model)
+        self.assertIsNone(config.cursor_model)
+        self.assertIsNone(config.gemini_model)
         self.assertIsNone(config.github_token)
         self.assertEqual(config.publish_pending, DEFAULT_PUBLISH_PENDING)
         self.assertEqual(config.smart_review, DEFAULT_SMART_REVIEW)
@@ -165,6 +168,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parser.get("git", "ssh_command"), "")
         self.assertEqual(parser.get("ai", "provider"), "codex")
         self.assertEqual(parser.get("codex", "model"), "")
+        self.assertEqual(parser.get("cursor", "model"), "")
+        self.assertEqual(parser.get("gemini", "model"), "")
         self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("telegram", "bot_token"), "")
         self.assertEqual(parser.get("telegram", "authorized_user_id"), "")
@@ -184,6 +189,8 @@ class CliTests(unittest.TestCase):
                     cache_dir="/tmp/review-cache",
                     ai_provider="codex",
                     codex_model="gpt-5.2",
+                    cursor_model="cursor-model",
+                    gemini_model="gemini-2.5-pro",
                     publish_pending=True,
                     smart_review=True,
                     max_comments=11,
@@ -196,6 +203,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.cache_dir, Path("/tmp/review-cache"))
         self.assertIsNone(config.git_ssh_command)
         self.assertEqual(config.codex_model, "gpt-5.2")
+        self.assertEqual(config.cursor_model, "cursor-model")
+        self.assertEqual(config.gemini_model, "gemini-2.5-pro")
         self.assertTrue(config.publish_pending)
         self.assertTrue(config.smart_review)
         self.assertEqual(config.max_comments, 11)
@@ -203,6 +212,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parser.get("git", "ssh_key_path"), "")
         self.assertEqual(parser.get("git", "ssh_command"), "")
         self.assertEqual(parser.get("codex", "model"), "gpt-5.2")
+        self.assertEqual(parser.get("cursor", "model"), "cursor-model")
+        self.assertEqual(parser.get("gemini", "model"), "gemini-2.5-pro")
         self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("telegram", "bot_token"), "")
         self.assertEqual(parser.get("telegram", "authorized_user_id"), "")
@@ -287,6 +298,8 @@ key = ghp_alias
         self.assertEqual(parser.get("git", "ssh_command"), "")
         self.assertEqual(parser.get("ai", "provider"), "codex")
         self.assertEqual(parser.get("codex", "model"), "")
+        self.assertEqual(parser.get("cursor", "model"), "")
+        self.assertEqual(parser.get("gemini", "model"), "")
         self.assertEqual(parser.get("review", "max_comments"), "20")
         self.assertEqual(parser.get("review", "smart_review"), "no")
         self.assertEqual(parser.get("github", "publish_pending"), "no")
@@ -576,6 +589,8 @@ smart_review = yes
                     cache_dir="/from/cli",
                     ai_provider="codex",
                     codex_model="gpt-5.2",
+                    cursor_model="cursor-model",
+                    gemini_model="gemini-2.5-pro",
                     publish_pending=False,
                     smart_review=False,
                     max_comments=3,
@@ -585,6 +600,8 @@ smart_review = yes
         self.assertEqual(config.cache_dir, Path("/from/cli"))
         self.assertEqual(config.ai_provider, "codex")
         self.assertEqual(config.codex_model, "gpt-5.2")
+        self.assertEqual(config.cursor_model, "cursor-model")
+        self.assertEqual(config.gemini_model, "gemini-2.5-pro")
         self.assertFalse(config.publish_pending)
         self.assertFalse(config.smart_review)
         self.assertEqual(config.max_comments, 3)
@@ -695,6 +712,16 @@ smart_review = yes
         self.assertEqual(raw, '{"summary": "ok"}')
         cmd = run_mock.call_args.args[0]
         self.assertEqual(cmd, ["cursor"])
+        cwd = run_mock.call_args.kwargs["cwd"]
+        self.assertEqual(cwd.name, "empty-workspace")
+
+    def test_run_gemini_uses_empty_workspace_without_cwd(self):
+        with patch("ai_review.cli.run", return_value='{"summary": "ok"}') as run_mock:
+            raw = run_gemini("prompt", None, "gemini-2.5-pro")
+
+        self.assertEqual(raw, '{"summary": "ok"}')
+        cmd = run_mock.call_args.args[0]
+        self.assertEqual(cmd, ["gemini", "--model", "gemini-2.5-pro"])
         cwd = run_mock.call_args.kwargs["cwd"]
         self.assertEqual(cwd.name, "empty-workspace")
 
@@ -815,6 +842,12 @@ smart_review = yes
 
         self.assertEqual(config.ai_provider, "cursor")
 
+    def test_ai_provider_is_gemini_type(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = build_config(self.args(config_file=Path(temp_dir) / "ai-review.conf", ai_provider="gemini"))
+
+        self.assertEqual(config.ai_provider, "gemini")
+
     def test_main_without_pr_url_still_creates_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "ai-review.conf"
@@ -827,6 +860,8 @@ smart_review = yes
 
         self.assertEqual(parser.get("ai", "provider"), "codex")
         self.assertEqual(parser.get("codex", "model"), "")
+        self.assertEqual(parser.get("cursor", "model"), "")
+        self.assertEqual(parser.get("gemini", "model"), "")
         self.assertEqual(parser.get("git", "cache_dir"), str(DEFAULT_CACHE_DIR))
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
         self.assertEqual(parser.get("review", "smart_review"), "no")
@@ -875,6 +910,8 @@ publish_pending = no
             "cache_dir": None,
             "ai_provider": None,
             "codex_model": None,
+            "cursor_model": None,
+            "gemini_model": None,
             "publish_pending": None,
             "max_comments": None,
             "save_prompt": None,
