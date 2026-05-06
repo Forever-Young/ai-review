@@ -45,6 +45,16 @@ AUTH_ERROR_PATTERNS = (
     "token",
     "unauthorized",
 )
+STATUS_COLOR = "\033[36m"
+DETAIL_COLOR = "\033[90m"
+RESET_COLOR = "\033[0m"
+
+
+def status(message: str, detail: str | None = None) -> None:
+    line = f"{STATUS_COLOR}[ai-review]{RESET_COLOR} {message}"
+    if detail:
+        line = f"{line} {DETAIL_COLOR}{detail}{RESET_COLOR}"
+    print(line, file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -326,6 +336,7 @@ def gh_api(
     if body is not None:
         cmd.extend(["--input", "-"])
     cmd.append(path)
+    status("Calling GitHub API", f"{method} {path}")
     return run(cmd, input_text=json.dumps(body) if body is not None else None, env=gh_env(github_token))
 
 
@@ -363,11 +374,14 @@ def ensure_checkout(pr: PullRequest, cache_dir: Path, git_ssh_command: str | Non
     clone_url = pr.base_ssh_url if git_ssh_command else pr.base_clone_url
     network_env = git_env(git_ssh_command)
     if not bare_repo.exists():
+        status("Cloning repository mirror", clone_url)
         run(["git", "clone", "--mirror", clone_url, str(bare_repo)], env=network_env)
     else:
+        status("Updating repository mirror", str(bare_repo))
         run(["git", "remote", "set-url", "origin", clone_url], cwd=bare_repo)
         run(["git", "fetch", "--prune", "origin"], cwd=bare_repo, env=network_env)
 
+    status("Fetching pull request head", f"PR #{pr.ref.number}")
     run(
         [
             "git",
@@ -381,11 +395,15 @@ def ensure_checkout(pr: PullRequest, cache_dir: Path, git_ssh_command: str | Non
 
     worktree = worktrees_dir / f"{pr.ref.slug}__pr-{pr.ref.number}"
     if worktree.exists():
+        status("Checking existing PR worktree", str(worktree))
         current = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).strip()
         if current == pr.head_sha:
+            status("Using cached PR worktree", str(worktree))
             return worktree
+        status("Refreshing PR worktree", str(worktree))
         run(["git", "worktree", "remove", "--force", str(worktree)], cwd=bare_repo)
 
+    status("Creating PR worktree", str(worktree))
     run(["git", "worktree", "add", "--force", "--detach", str(worktree), pr.head_sha], cwd=bare_repo)
     return worktree
 
@@ -516,6 +534,7 @@ def extract_ticket_key_heuristic(pr: PullRequest, first_comment: str) -> str | N
 
 
 def extract_ticket_key_with_codex(pr: PullRequest, first_comment: str, checkout: Path, model: str | None) -> str | None:
+    status("Asking Codex to identify Jira ticket")
     raw = run_codex(build_ticket_extraction_prompt(pr, first_comment), checkout, model)
     try:
         data = json.loads(raw.strip())
@@ -535,10 +554,12 @@ def extract_ticket_key(pr: PullRequest, first_comment: str, checkout: Path, mode
 
 
 def mcporter_auth(server: str, timeout_ms: int) -> None:
+    status("Authenticating Jira MCP server", server)
     run(["mcporter", "--oauth-timeout", str(timeout_ms), "auth", server])
 
 
 def mcporter_call(selector: str, args: dict[str, Any], timeout_ms: int) -> str:
+    status("Calling Jira MCP tool", selector)
     return run(
         [
             "mcporter",
@@ -568,6 +589,7 @@ def trim_context(value: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
 def fetch_jira_tool_context(label: str, selector: str | None, issue_arg: str, ticket_key: str, timeout_ms: int) -> str:
     if not selector:
         return ""
+    status("Loading Jira context", f"{label} for {ticket_key}")
     try:
         raw = mcporter_call(selector, {issue_arg: ticket_key}, timeout_ms)
     except SystemExit as exc:
@@ -584,11 +606,15 @@ def fetch_jira_tool_context(label: str, selector: str | None, issue_arg: str, ti
 
 def load_jira_context(config: JiraConfig, pr: PullRequest, first_comment: str, checkout: Path, model: str | None) -> str | None:
     if not config.enabled:
+        status("Skipping Jira context", "disabled")
         return None
+    status("Checking Jira context")
     ticket_key = extract_ticket_key(pr, first_comment, checkout, model)
     if not ticket_key:
+        status("No Jira ticket key found")
         return "Jira was enabled, but no ticket key could be extracted from the branch, PR title, PR body, or first PR comment."
 
+    status("Found Jira ticket", ticket_key)
     parts = [f"Ticket key: {ticket_key}\n"]
     parts.append(fetch_jira_tool_context("Issue", DEFAULT_JIRA_ISSUE_TOOL, DEFAULT_JIRA_ISSUE_ARG, ticket_key, DEFAULT_MCP_TIMEOUT_MS))
     parts.append(
@@ -624,6 +650,7 @@ def run_codex(prompt: str, checkout: Path, model: str | None) -> str:
         if model:
             cmd.extend(["--model", model])
         cmd.append("-")
+        status("Running Codex reviewer", f"model {model}" if model else None)
         stdout = run(cmd, input_text=prompt)
         if output_file.exists():
             return output_file.read_text(encoding="utf-8")
@@ -673,6 +700,7 @@ def validate_comments(review: ReviewResult, changed: dict[str, set[int]], max_co
 
 
 def create_pending_review(pr: PullRequest, review: ReviewResult, github_token: str | None = None) -> int:
+    status("Creating pending GitHub review", f"{len(review.comments)} inline, {len(review.pr_comments)} PR-level")
     payload = {
         "commit_id": pr.head_sha,
         "body": build_review_body(review),
@@ -777,18 +805,25 @@ def main(argv: list[str] | None = None) -> int:
     if not args.pr_url:
         parser.error("the following arguments are required: pr_url")
     ref = parse_pr_url(args.pr_url)
+    status("Loading pull request", f"{ref.owner}/{ref.repo}#{ref.number}")
     pr = load_pr(ref, config.github_token)
 
     checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
+    if config.jira.enabled:
+        status("Loading first PR comment for Jira ticket detection")
     first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
     jira_context = load_jira_context(config.jira, pr, first_comment, checkout, config.codex_model)
+    status("Loading pull request diff")
     diff = load_diff(ref, config.github_token)
+    status("Building review prompt")
     prompt = build_prompt(pr, diff, jira_context)
     if config.save_prompt:
+        status("Saving review prompt", str(config.save_prompt))
         config.save_prompt.parent.mkdir(parents=True, exist_ok=True)
         config.save_prompt.write_text(prompt, encoding="utf-8")
 
     raw_review = run_codex(prompt, checkout, config.codex_model)
+    status("Validating reviewer findings")
     review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
 
     print(f"Checked out PR head at: {checkout}")
