@@ -27,7 +27,7 @@ DEFAULT_AI_PROVIDER = "codex"
 DEFAULT_PUBLISH_PENDING = True
 DEFAULT_SMART_REVIEW = False
 DEFAULT_MAX_COMMENTS = 20
-SUPPORTED_AI_PROVIDERS = {"codex"}
+SUPPORTED_AI_PROVIDERS = {"codex", "cursor"}
 DEFAULT_JIRA_ENABLED = False
 DEFAULT_JIRA_MCP_SERVER = "jira"
 DEFAULT_JIRA_ISSUE_TOOL = "jira.get_issue"
@@ -774,9 +774,14 @@ def extract_ticket_key_heuristic(pr: PullRequest, first_comment: str) -> str | N
     return None
 
 
-def extract_ticket_key_with_codex(pr: PullRequest, first_comment: str, model: str | None) -> str | None:
-    status("Asking Codex to identify Jira ticket")
-    raw = run_codex(build_ticket_extraction_prompt(pr, first_comment), None, model)
+def extract_ticket_key_with_ai_provider(
+    pr: PullRequest,
+    first_comment: str,
+    provider: str,
+    model: str | None,
+) -> str | None:
+    status("Asking AI provider to identify Jira ticket", provider)
+    raw = run_ai_provider(build_ticket_extraction_prompt(pr, first_comment), None, provider, model)
     try:
         data = json.loads(raw.strip())
     except json.JSONDecodeError:
@@ -788,8 +793,10 @@ def extract_ticket_key_with_codex(pr: PullRequest, first_comment: str, model: st
     return match.group(1) if match else None
 
 
-def extract_ticket_key(pr: PullRequest, first_comment: str, model: str | None) -> str | None:
-    return extract_ticket_key_with_codex(pr, first_comment, model) or extract_ticket_key_heuristic(pr, first_comment)
+def extract_ticket_key(pr: PullRequest, first_comment: str, provider: str, model: str | None) -> str | None:
+    return extract_ticket_key_with_ai_provider(pr, first_comment, provider, model) or extract_ticket_key_heuristic(
+        pr, first_comment
+    )
 
 
 def mcporter_auth(server: str, timeout_ms: int) -> None:
@@ -853,12 +860,18 @@ def fetch_jira_tool_context(label: str, selector: str | None, issue_arg: str, ti
     return f"{label} ({selector}):\n{raw}\n"
 
 
-def load_jira_context(config: JiraConfig, pr: PullRequest, first_comment: str, model: str | None) -> str | None:
+def load_jira_context(
+    config: JiraConfig,
+    pr: PullRequest,
+    first_comment: str,
+    ai_provider: str,
+    model: str | None,
+) -> str | None:
     if not config.enabled:
         status("Skipping Jira context", "disabled")
         return None
     status("Checking Jira context")
-    ticket_key = extract_ticket_key(pr, first_comment, model)
+    ticket_key = extract_ticket_key(pr, first_comment, ai_provider, model)
     if not ticket_key:
         status("No Jira ticket key found")
         return "Jira was enabled, but no ticket key could be extracted from the branch, PR title, PR body, or first PR comment."
@@ -910,6 +923,25 @@ def run_codex(prompt: str, cwd: Path | None, model: str | None) -> str:
         if output_file.exists():
             return output_file.read_text(encoding="utf-8")
         return stdout
+
+
+def run_cursor(prompt: str, cwd: Path | None) -> str:
+    with tempfile.TemporaryDirectory(prefix="ai-review-cursor-") as temp_dir:
+        if cwd is None:
+            cwd = Path(temp_dir) / "empty-workspace"
+            cwd.mkdir()
+        status("Running Cursor reviewer")
+        return run(["cursor"], cwd=cwd, input_text=prompt)
+
+
+def run_ai_provider(prompt: str, cwd: Path | None, provider: str, model: str | None) -> str:
+    normalized_provider = provider.strip().lower()
+    if normalized_provider == "codex":
+        return run_codex(prompt, cwd, model)
+    if normalized_provider == "cursor":
+        return run_cursor(prompt, cwd)
+    supported = ", ".join(sorted(SUPPORTED_AI_PROVIDERS))
+    raise SystemExit(f"Unsupported AI provider {provider!r}. Supported providers: {supported}.")
 
 
 def parse_review(raw: str) -> ReviewResult:
@@ -1074,7 +1106,7 @@ def run_review_command(args: argparse.Namespace, config: AppConfig) -> int:
 
     pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
     first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
-    jira_context = load_jira_context(config.jira, pr, first_comment, config.codex_model)
+    jira_context = load_jira_context(config.jira, pr, first_comment, config.ai_provider, config.codex_model)
     status("Loading pull request diff")
     diff = load_diff(ref, config.github_token)
     status("Building review prompt")
@@ -1087,7 +1119,7 @@ def run_review_command(args: argparse.Namespace, config: AppConfig) -> int:
     checkout: Path | None = None
     if config.smart_review:
         checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
-    raw_review = run_codex(prompt, checkout, config.codex_model)
+    raw_review = run_ai_provider(prompt, checkout, config.ai_provider, config.codex_model)
     status("Validating reviewer findings")
     review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
 
@@ -1144,7 +1176,7 @@ def run_review_to_pending_review_url(pr_url: str, config: AppConfig) -> str:
 
     pr_discussion_context = load_pr_discussion_context(ref, config.github_token)
     first_comment = load_first_pr_comment(ref, config.github_token) if config.jira.enabled else ""
-    jira_context = load_jira_context(config.jira, pr, first_comment, config.codex_model)
+    jira_context = load_jira_context(config.jira, pr, first_comment, config.ai_provider, config.codex_model)
     status("Loading pull request diff")
     diff = load_diff(ref, config.github_token)
     status("Building review prompt")
@@ -1157,7 +1189,7 @@ def run_review_to_pending_review_url(pr_url: str, config: AppConfig) -> str:
     checkout: Path | None = None
     if config.smart_review:
         checkout = ensure_checkout(pr, config.cache_dir, config.git_ssh_command)
-    raw_review = run_codex(prompt, checkout, config.codex_model)
+    raw_review = run_ai_provider(prompt, checkout, config.ai_provider, config.codex_model)
     status("Validating reviewer findings")
     review = validate_comments(parse_review(raw_review), changed_right_lines(diff), config.max_comments)
     if not review.comments and not review.pr_comments and not review.summary:
@@ -1282,9 +1314,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ai-provider",
         choices=sorted(SUPPORTED_AI_PROVIDERS),
-        help="AI provider type to use. Defaults to codex.",
+        help="AI provider type to use. Defaults to codex. Supported: codex, cursor.",
     )
-    parser.add_argument("--codex-model", help="Optional model passed to `codex exec --model`.")
+    parser.add_argument("--codex-model", help="Optional model passed to `codex exec --model` (codex provider only).")
     parser.add_argument(
         "--publish-pending",
         action=argparse.BooleanOptionalAction,

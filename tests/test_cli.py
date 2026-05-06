@@ -30,6 +30,7 @@ from ai_review.cli import (
     parse_pr_url,
     parse_review,
     run_codex,
+    run_cursor,
     run_review_for_bot_result,
     validate_comments,
 )
@@ -687,6 +688,16 @@ smart_review = yes
         cwd = Path(cmd[cmd.index("-C") + 1])
         self.assertEqual(cwd.name, "empty-workspace")
 
+    def test_run_cursor_uses_empty_workspace_without_cwd(self):
+        with patch("ai_review.cli.run", return_value='{"summary": "ok"}') as run_mock:
+            raw = run_cursor("prompt", None)
+
+        self.assertEqual(raw, '{"summary": "ok"}')
+        cmd = run_mock.call_args.args[0]
+        self.assertEqual(cmd, ["cursor"])
+        cwd = run_mock.call_args.kwargs["cwd"]
+        self.assertEqual(cwd.name, "empty-workspace")
+
     def test_main_skips_checkout_when_smart_review_is_disabled(self):
         pr = PullRequest(
             ref=PullRequestRef("example", "project", 42),
@@ -797,6 +808,12 @@ smart_review = yes
             config = build_config(self.args(config_file=Path(temp_dir) / "ai-review.conf", ai_provider="codex"))
 
         self.assertEqual(config.ai_provider, "codex")
+
+    def test_ai_provider_is_cursor_type(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = build_config(self.args(config_file=Path(temp_dir) / "ai-review.conf", ai_provider="cursor"))
+
+        self.assertEqual(config.ai_provider, "cursor")
 
     def test_main_without_pr_url_still_creates_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
