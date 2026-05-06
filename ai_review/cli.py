@@ -11,12 +11,16 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 import textwrap
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+from . import codex as codex_provider
+from . import cursor as cursor_provider
+from . import gh as gh_client
+from . import jira as jira_client
 
 
 GITHUB_PR_RE = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)(?:[/?#].*)?$")
@@ -464,12 +468,7 @@ def git_env(git_ssh_command: str | None) -> dict[str, str] | None:
 
 
 def gh_env(github_token: str | None) -> dict[str, str] | None:
-    if not github_token:
-        return None
-    env = os.environ.copy()
-    env["GH_PROMPT_DISABLED"] = "1"
-    env["GH_TOKEN"] = github_token
-    return env
+    return gh_client.gh_env(github_token)
 
 
 def gh_api(
@@ -480,16 +479,15 @@ def gh_api(
     body: Any = None,
     github_token: str | None = None,
 ) -> str:
-    cmd = ["gh", "api"]
-    for header in headers or []:
-        cmd.extend(["-H", header])
-    if method != "GET":
-        cmd.extend(["--method", method])
-    if body is not None:
-        cmd.extend(["--input", "-"])
-    cmd.append(path)
-    status("Calling GitHub API", f"{method} {path}")
-    return run(cmd, input_text=json.dumps(body) if body is not None else None, env=gh_env(github_token))
+    return gh_client.gh_api(
+        path,
+        method=method,
+        headers=headers,
+        body=body,
+        github_token=github_token,
+        run_cmd=run,
+        status_cb=status,
+    )
 
 
 def load_pr(ref: PullRequestRef, github_token: str | None = None) -> PullRequest:
@@ -800,36 +798,19 @@ def extract_ticket_key(pr: PullRequest, first_comment: str, provider: str, model
 
 
 def mcporter_auth(server: str, timeout_ms: int) -> None:
-    status("Authenticating Jira MCP server", server)
-    run(["mcporter", "--oauth-timeout", str(timeout_ms), "auth", server])
+    jira_client.mcporter_auth(server, timeout_ms, run_cmd=run, status_cb=status)
 
 
 def mcporter_auth_streaming(server: str, timeout_ms: int) -> None:
-    status("Authenticating Jira MCP server", server)
-    status("Follow any MCPorter auth URL or instructions shown below")
-    run_streaming(["mcporter", "--oauth-timeout", str(timeout_ms), "auth", server])
+    jira_client.mcporter_auth_streaming(server, timeout_ms, run_streaming_cmd=run_streaming, status_cb=status)
 
 
 def mcporter_call(selector: str, args: dict[str, Any], timeout_ms: int) -> str:
-    status("Calling Jira MCP tool", selector)
-    return run(
-        [
-            "mcporter",
-            "call",
-            selector,
-            "--args",
-            json.dumps(args),
-            "--timeout",
-            str(timeout_ms),
-            "--output",
-            "json",
-        ]
-    )
+    return jira_client.mcporter_call(selector, args, timeout_ms, run_cmd=run, status_cb=status)
 
 
 def is_auth_error(message: str) -> bool:
-    normalized = message.lower()
-    return any(pattern in normalized for pattern in AUTH_ERROR_PATTERNS)
+    return jira_client.is_auth_error(message)
 
 
 def trim_context(value: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
@@ -839,25 +820,18 @@ def trim_context(value: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
 
 
 def fetch_jira_tool_context(label: str, selector: str | None, issue_arg: str, ticket_key: str, timeout_ms: int) -> str:
-    if not selector:
-        return ""
-    status("Loading Jira context", f"{label} for {ticket_key}")
-    try:
-        raw = mcporter_call(selector, {issue_arg: ticket_key}, timeout_ms)
-    except SystemExit as exc:
-        if is_auth_error(str(exc)):
-            try:
-                auth_handler = JIRA_AUTH_HANDLER.get()
-                if auth_handler:
-                    auth_handler()
-                else:
-                    mcporter_auth(DEFAULT_JIRA_MCP_SERVER, DEFAULT_MCP_TIMEOUT_MS)
-                raw = mcporter_call(selector, {issue_arg: ticket_key}, timeout_ms)
-            except SystemExit as retry_exc:
-                return f"{label}: failed to load through {selector} after Jira auth retry: {retry_exc}\n"
-            return f"{label} ({selector}):\n{raw}\n"
-        return f"{label}: failed to load through {selector}: {exc}\n"
-    return f"{label} ({selector}):\n{raw}\n"
+    return jira_client.fetch_jira_tool_context(
+        label,
+        selector,
+        issue_arg,
+        ticket_key,
+        timeout_ms,
+        run_cmd=run,
+        status_cb=status,
+        auth_handler_var=JIRA_AUTH_HANDLER,
+        call_tool=mcporter_call,
+        auth_func=mcporter_auth,
+    )
 
 
 def load_jira_context(
@@ -897,41 +871,11 @@ def load_jira_context(
 
 
 def run_codex(prompt: str, cwd: Path | None, model: str | None) -> str:
-    with tempfile.TemporaryDirectory(prefix="ai-review-codex-") as temp_dir:
-        if cwd is None:
-            cwd = Path(temp_dir) / "empty-workspace"
-            cwd.mkdir()
-        output_file = Path(temp_dir) / "review.json"
-        cmd = [
-            "codex",
-            "exec",
-            "--config",
-            'approval_policy="never"',
-            "--skip-git-repo-check",
-            "-C",
-            str(cwd),
-            "--sandbox",
-            "read-only",
-            "--output-last-message",
-            str(output_file),
-        ]
-        if model:
-            cmd.extend(["--model", model])
-        cmd.append("-")
-        status("Running Codex reviewer", f"model {model}" if model else None)
-        stdout = run(cmd, input_text=prompt)
-        if output_file.exists():
-            return output_file.read_text(encoding="utf-8")
-        return stdout
+    return codex_provider.run_codex(prompt, cwd, model, run_cmd=run, status_cb=status)
 
 
 def run_cursor(prompt: str, cwd: Path | None) -> str:
-    with tempfile.TemporaryDirectory(prefix="ai-review-cursor-") as temp_dir:
-        if cwd is None:
-            cwd = Path(temp_dir) / "empty-workspace"
-            cwd.mkdir()
-        status("Running Cursor reviewer")
-        return run(["cursor"], cwd=cwd, input_text=prompt)
+    return cursor_provider.run_cursor(prompt, cwd, run_cmd=run, status_cb=status)
 
 
 def run_ai_provider(prompt: str, cwd: Path | None, provider: str, model: str | None) -> str:
