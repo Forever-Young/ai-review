@@ -73,6 +73,10 @@ def status(message: str, detail: str | None = None) -> None:
         listener(plain_line)
 
 
+def sanitize_telegram_progress_line(line: str) -> str:
+    return re.sub(r"^\[ai-review\]\s*", "", line).strip()
+
+
 @dataclass(frozen=True)
 class PullRequestRef:
     owner: str
@@ -890,6 +894,7 @@ def run_codex(prompt: str, cwd: Path | None, model: str | None) -> str:
             "exec",
             "--config",
             'approval_policy="never"',
+            "--skip-git-repo-check",
             "-C",
             str(cwd),
             "--sandbox",
@@ -1217,7 +1222,10 @@ def run_telegram_bot(config: AppConfig) -> int:
                 pass
 
         def progress(line: str) -> None:
-            future = asyncio.run_coroutine_threadsafe(update_progress(line), loop)
+            clean_line = sanitize_telegram_progress_line(line)
+            if not clean_line:
+                return
+            future = asyncio.run_coroutine_threadsafe(update_progress(clean_line), loop)
             try:
                 future.result(timeout=10)
             except Exception:
@@ -1236,7 +1244,15 @@ def run_telegram_bot(config: AppConfig) -> int:
             if jira_auth_token is not None:
                 JIRA_AUTH_HANDLER.reset(jira_auth_token)
 
-        await update_progress("Review complete." if ok else "Review failed.")
+        if ok:
+            # On success, replace progress with only the pending review URL.
+            try:
+                await progress_message.edit_text(output.strip())
+            except Exception:
+                await update.message.reply_text(output.strip())
+            return
+
+        await update_progress("Review failed.")
         for chunk in chunk_telegram_message(output):
             await update.message.reply_text(chunk)
 

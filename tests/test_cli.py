@@ -681,6 +681,7 @@ smart_review = yes
         cmd = run_mock.call_args.args[0]
         self.assertIn("--config", cmd)
         self.assertIn('approval_policy="never"', cmd)
+        self.assertIn("--skip-git-repo-check", cmd)
         self.assertIn("--sandbox", cmd)
         self.assertIn("read-only", cmd)
         cwd = Path(cmd[cmd.index("-C") + 1])
