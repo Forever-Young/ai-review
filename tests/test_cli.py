@@ -4,13 +4,20 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 from ai_review.cli import (
     DEFAULT_CACHE_DIR,
     DEFAULT_CONFIG_FILE,
     DEFAULT_PUBLISH_PENDING,
+    PullRequest,
+    PullRequestRef,
     build_config,
+    build_review_body,
     changed_right_lines,
+    extract_ticket_key_heuristic,
+    fetch_jira_tool_context,
+    is_auth_error,
     main,
     parse_pr_url,
     parse_review,
@@ -24,6 +31,34 @@ class CliTests(unittest.TestCase):
         self.assertEqual(ref.owner, "example")
         self.assertEqual(ref.repo, "project")
         self.assertEqual(ref.number, 42)
+
+    def test_extract_ticket_key_from_branch(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Add feature",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="ABC12-123-something-short-desc",
+        )
+
+        self.assertEqual(extract_ticket_key_heuristic(pr, ""), "ABC12-123")
+
+    def test_extract_ticket_key_from_first_comment_refs(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="feat: add feature",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+
+        self.assertEqual(extract_ticket_key_heuristic(pr, "Refs: ABC-123"), "ABC-123")
 
     def test_changed_right_lines_tracks_added_lines(self):
         diff = """diff --git a/app.py b/app.py
@@ -55,6 +90,36 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual([comment.line for comment in validated.comments], [2])
 
+    def test_parse_review_supports_pr_level_comments(self):
+        review = parse_review(
+            json.dumps(
+                {
+                    "summary": "summary",
+                    "pr_comments": ["Missing the requested empty-state behavior."],
+                    "comments": [],
+                }
+            )
+        )
+
+        self.assertEqual(review.pr_comments, ["Missing the requested empty-state behavior."])
+        self.assertIn("PR-level comments", build_review_body(review))
+
+    def test_auth_error_detection(self):
+        self.assertTrue(is_auth_error("HTTP 401 unauthorized"))
+        self.assertTrue(is_auth_error("OAuth token expired"))
+        self.assertFalse(is_auth_error("tool not found"))
+
+    def test_jira_context_authenticates_and_retries_on_auth_failure(self):
+        calls = [SystemExit("HTTP 401 unauthorized"), '{"ok": true}']
+
+        with patch("ai_review.cli.mcporter_call", side_effect=calls) as call_mock:
+            with patch("ai_review.cli.mcporter_auth") as auth_mock:
+                context = fetch_jira_tool_context("Issue", "jira.get_issue", "issueKey", "ABC-123", 60000)
+
+        self.assertIn('{"ok": true}', context)
+        self.assertEqual(call_mock.call_count, 2)
+        auth_mock.assert_called_once()
+
     def test_config_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "ai-review.conf"
@@ -79,6 +144,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parser.get("git", "cache_dir"), str(DEFAULT_CACHE_DIR))
         self.assertEqual(parser.get("ai", "provider"), "codex")
         self.assertEqual(parser.get("codex", "model"), "")
+        self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("review", "max_comments"), "20")
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
 
@@ -106,6 +172,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.max_comments, 11)
         self.assertEqual(parser.get("git", "cache_dir"), "/tmp/review-cache")
         self.assertEqual(parser.get("codex", "model"), "gpt-5.2")
+        self.assertEqual(parser.get("jira", "enabled"), "no")
         self.assertEqual(parser.get("review", "max_comments"), "11")
         self.assertEqual(parser.get("review", "save_prompt"), "/tmp/prompt.txt")
         self.assertEqual(parser.get("github", "publish_pending"), "yes")
@@ -212,6 +279,8 @@ publish_pending = yes
             "publish_pending": None,
             "max_comments": None,
             "save_prompt": None,
+            "jira_enabled": None,
+            "jira_auth": False,
         }
         values.update(overrides)
         return Namespace(**values)

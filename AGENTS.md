@@ -21,6 +21,8 @@ submission.
   `model`.
 - Do not add a generic shell-command AI provider unless the project direction
   explicitly changes.
+- Jira support is optional context loading through `mcporter`; keep it separate
+  from the AI provider implementation.
 
 ## Verification
 

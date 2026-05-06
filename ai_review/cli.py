@@ -20,6 +20,29 @@ DEFAULT_CACHE_DIR = Path("~/.local/cache/ai-review").expanduser()
 DEFAULT_AI_PROVIDER = "codex"
 DEFAULT_PUBLISH_PENDING = True
 SUPPORTED_AI_PROVIDERS = {"codex"}
+DEFAULT_JIRA_ENABLED = False
+DEFAULT_JIRA_MCP_SERVER = "jira"
+DEFAULT_JIRA_ISSUE_TOOL = "jira.get_issue"
+DEFAULT_JIRA_ISSUE_ARG = "issueKey"
+DEFAULT_JIRA_COMMENTS_TOOL = "jira.get_comments"
+DEFAULT_JIRA_ATTACHMENTS_TOOL = "jira.get_attachments"
+DEFAULT_MCP_TIMEOUT_MS = 60_000
+MAX_CONTEXT_CHARS = 60_000
+TICKET_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+AUTH_ERROR_PATTERNS = (
+    "401",
+    "403",
+    "auth",
+    "authorize",
+    "authorization",
+    "credential",
+    "forbidden",
+    "login",
+    "oauth",
+    "permission",
+    "token",
+    "unauthorized",
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +65,7 @@ class PullRequest:
     base_clone_url: str
     base_sha: str
     head_sha: str
+    head_ref: str
 
 
 @dataclass(frozen=True)
@@ -55,6 +79,12 @@ class ReviewComment:
 class ReviewResult:
     summary: str
     comments: list[ReviewComment]
+    pr_comments: list[str]
+
+
+@dataclass(frozen=True)
+class JiraConfig:
+    enabled: bool
 
 
 @dataclass(frozen=True)
@@ -66,6 +96,7 @@ class AppConfig:
     publish_pending: bool
     max_comments: int
     save_prompt: Path | None
+    jira: JiraConfig
 
 
 def run(cmd: list[str], cwd: Path | None = None, input_text: str | None = None) -> str:
@@ -155,6 +186,9 @@ def create_default_config_file(path: Path, args: argparse.Namespace) -> None:
             args.publish_pending if args.publish_pending is not None else DEFAULT_PUBLISH_PENDING
         ),
     }
+    parser["jira"] = {
+        "enabled": bool_config_value(args.jira_enabled if args.jira_enabled is not None else DEFAULT_JIRA_ENABLED),
+    }
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as config_file:
@@ -175,6 +209,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     codex_model = blank_to_none(args.codex_model or config_get(parser, "codex", "model"))
     max_comments_raw = args.max_comments if args.max_comments is not None else config_get(parser, "review", "max_comments")
     save_prompt_raw = args.save_prompt or config_get(parser, "review", "save_prompt")
+    jira = build_jira_config(args, parser)
 
     publish_pending = DEFAULT_PUBLISH_PENDING
     configured_publish = config_get(parser, "github", "publish_pending")
@@ -203,7 +238,19 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         publish_pending=publish_pending,
         max_comments=max_comments,
         save_prompt=expand_path(save_prompt_raw) if save_prompt_raw else None,
+        jira=jira,
     )
+
+
+def build_jira_config(args: argparse.Namespace, parser: configparser.ConfigParser) -> JiraConfig:
+    jira_enabled = DEFAULT_JIRA_ENABLED
+    configured_enabled = config_get(parser, "jira", "enabled")
+    if configured_enabled is not None:
+        jira_enabled = parse_bool(configured_enabled)
+    if args.jira_enabled is not None:
+        jira_enabled = args.jira_enabled
+
+    return JiraConfig(enabled=jira_enabled)
 
 
 def gh_api(path: str, *, method: str = "GET", headers: list[str] | None = None, body: Any = None) -> str:
@@ -229,7 +276,16 @@ def load_pr(ref: PullRequestRef) -> PullRequest:
         base_clone_url=data["base"]["repo"]["clone_url"],
         base_sha=data["base"]["sha"],
         head_sha=data["head"]["sha"],
+        head_ref=data["head"]["ref"],
     )
+
+
+def load_first_pr_comment(ref: PullRequestRef) -> str:
+    raw = gh_api(f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments?per_page=1")
+    data = json.loads(raw)
+    if not data:
+        return ""
+    return data[0].get("body") or ""
 
 
 def ensure_checkout(pr: PullRequest, cache_dir: Path) -> Path:
@@ -300,10 +356,12 @@ def changed_right_lines(diff: str) -> dict[str, set[int]]:
     return changed
 
 
-def build_prompt(pr: PullRequest, diff: str) -> str:
+def build_prompt(pr: PullRequest, diff: str, jira_context: str | None) -> str:
     trimmed_diff = diff
     if len(trimmed_diff) > MAX_DIFF_CHARS:
         trimmed_diff = diff[:MAX_DIFF_CHARS] + "\n\n[Diff truncated by ai-review]\n"
+
+    jira_section = jira_context or "No Jira context was loaded."
 
     return textwrap.dedent(
         f"""
@@ -314,6 +372,9 @@ def build_prompt(pr: PullRequest, diff: str) -> str:
         Return only valid JSON with this shape:
         {{
           "summary": "one short paragraph",
+          "pr_comments": [
+            "optional PR-level comment for missing feature scope, incomplete ticket coverage, or broad design risk"
+          ],
           "comments": [
             {{
               "path": "relative/file/path",
@@ -327,12 +388,19 @@ def build_prompt(pr: PullRequest, diff: str) -> str:
         - Only comment on added or changed RIGHT-side lines present in the diff.
         - Each body must explain the risk and the change needed.
         - Prefer no comment over a speculative comment.
+        - Use pr_comments only for review feedback that cannot be attached to a
+          specific changed line.
         - Limit to the highest-signal findings.
+        - If Jira context is present, check whether the PR appears to satisfy
+          the ticket requirements and note likely gaps.
 
         PR: {pr.html_url}
         Title: {pr.title}
         Body:
         {pr.body}
+
+        Jira context:
+        {jira_section}
 
         Unified diff:
         ```diff
@@ -340,6 +408,135 @@ def build_prompt(pr: PullRequest, diff: str) -> str:
         ```
         """
     ).strip()
+
+
+def build_ticket_extraction_prompt(pr: PullRequest, first_comment: str) -> str:
+    return textwrap.dedent(
+        f"""
+        Extract the Jira ticket key for this GitHub pull request.
+
+        Return only valid JSON:
+        {{"ticket_key": "ABC-123"}}
+
+        If no ticket key is present, return:
+        {{"ticket_key": null}}
+
+        Ticket key examples:
+        - Branch "ABC-123-something" means "ABC-123".
+        - Branch "ABC12-123-something-short-desc" means "ABC12-123".
+        - PR text may include "Refs: TICKET-123".
+
+        Branch: {pr.head_ref}
+        PR title: {pr.title}
+        PR body:
+        {pr.body}
+
+        First PR comment:
+        {first_comment}
+        """
+    ).strip()
+
+
+def extract_ticket_key_heuristic(pr: PullRequest, first_comment: str) -> str | None:
+    candidates = [pr.head_ref, pr.title, pr.body, first_comment]
+    for candidate in candidates:
+        match = TICKET_KEY_RE.search(candidate or "")
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_ticket_key_with_codex(pr: PullRequest, first_comment: str, checkout: Path, model: str | None) -> str | None:
+    raw = run_codex(build_ticket_extraction_prompt(pr, first_comment), checkout, model)
+    try:
+        data = json.loads(raw.strip())
+    except json.JSONDecodeError:
+        return None
+    ticket_key = data.get("ticket_key")
+    if not ticket_key:
+        return None
+    match = TICKET_KEY_RE.search(str(ticket_key))
+    return match.group(1) if match else None
+
+
+def extract_ticket_key(pr: PullRequest, first_comment: str, checkout: Path, model: str | None) -> str | None:
+    return extract_ticket_key_with_codex(pr, first_comment, checkout, model) or extract_ticket_key_heuristic(
+        pr, first_comment
+    )
+
+
+def mcporter_auth(server: str, timeout_ms: int) -> None:
+    run(["mcporter", "--oauth-timeout", str(timeout_ms), "auth", server])
+
+
+def mcporter_call(selector: str, args: dict[str, Any], timeout_ms: int) -> str:
+    return run(
+        [
+            "mcporter",
+            "call",
+            selector,
+            "--args",
+            json.dumps(args),
+            "--timeout",
+            str(timeout_ms),
+            "--output",
+            "json",
+        ]
+    )
+
+
+def is_auth_error(message: str) -> bool:
+    normalized = message.lower()
+    return any(pattern in normalized for pattern in AUTH_ERROR_PATTERNS)
+
+
+def trim_context(value: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "\n\n[Jira context truncated by ai-review]\n"
+
+
+def fetch_jira_tool_context(label: str, selector: str | None, issue_arg: str, ticket_key: str, timeout_ms: int) -> str:
+    if not selector:
+        return ""
+    try:
+        raw = mcporter_call(selector, {issue_arg: ticket_key}, timeout_ms)
+    except SystemExit as exc:
+        if is_auth_error(str(exc)):
+            try:
+                mcporter_auth(DEFAULT_JIRA_MCP_SERVER, DEFAULT_MCP_TIMEOUT_MS)
+                raw = mcporter_call(selector, {issue_arg: ticket_key}, timeout_ms)
+            except SystemExit as retry_exc:
+                return f"{label}: failed to load through {selector} after Jira auth retry: {retry_exc}\n"
+            return f"{label} ({selector}):\n{raw}\n"
+        return f"{label}: failed to load through {selector}: {exc}\n"
+    return f"{label} ({selector}):\n{raw}\n"
+
+
+def load_jira_context(config: JiraConfig, pr: PullRequest, first_comment: str, checkout: Path, model: str | None) -> str | None:
+    if not config.enabled:
+        return None
+    ticket_key = extract_ticket_key(pr, first_comment, checkout, model)
+    if not ticket_key:
+        return "Jira was enabled, but no ticket key could be extracted from the branch, PR title, PR body, or first PR comment."
+
+    parts = [f"Ticket key: {ticket_key}\n"]
+    parts.append(fetch_jira_tool_context("Issue", DEFAULT_JIRA_ISSUE_TOOL, DEFAULT_JIRA_ISSUE_ARG, ticket_key, DEFAULT_MCP_TIMEOUT_MS))
+    parts.append(
+        fetch_jira_tool_context(
+            "Comments", DEFAULT_JIRA_COMMENTS_TOOL, DEFAULT_JIRA_ISSUE_ARG, ticket_key, DEFAULT_MCP_TIMEOUT_MS
+        )
+    )
+    parts.append(
+        fetch_jira_tool_context(
+            "Attachments/images",
+            DEFAULT_JIRA_ATTACHMENTS_TOOL,
+            DEFAULT_JIRA_ISSUE_ARG,
+            ticket_key,
+            DEFAULT_MCP_TIMEOUT_MS,
+        )
+    )
+    return trim_context("\n".join(part for part in parts if part))
 
 
 def run_codex(prompt: str, checkout: Path, model: str | None) -> str:
@@ -387,7 +584,8 @@ def parse_review(raw: str) -> ReviewResult:
         except (KeyError, TypeError, ValueError) as exc:
             raise SystemExit(f"Invalid review comment object: {item!r}") from exc
 
-    return ReviewResult(summary=str(data.get("summary") or ""), comments=comments)
+    pr_comments = [str(item).strip() for item in data.get("pr_comments", []) if str(item).strip()]
+    return ReviewResult(summary=str(data.get("summary") or ""), comments=comments, pr_comments=pr_comments)
 
 
 def validate_comments(review: ReviewResult, changed: dict[str, set[int]], max_comments: int) -> ReviewResult:
@@ -402,13 +600,13 @@ def validate_comments(review: ReviewResult, changed: dict[str, set[int]], max_co
     if rejected:
         print(f"Rejected {len(rejected)} comment(s) that did not target added RIGHT-side diff lines.", file=sys.stderr)
 
-    return ReviewResult(summary=review.summary, comments=valid[:max_comments])
+    return ReviewResult(summary=review.summary, comments=valid[:max_comments], pr_comments=review.pr_comments)
 
 
 def create_pending_review(pr: PullRequest, review: ReviewResult) -> int:
     payload = {
         "commit_id": pr.head_sha,
-        "body": review.summary or "AI review draft.",
+        "body": build_review_body(review),
         "comments": [
             {
                 "path": comment.path,
@@ -427,12 +625,26 @@ def create_pending_review(pr: PullRequest, review: ReviewResult) -> int:
     return int(json.loads(raw)["id"])
 
 
+def build_review_body(review: ReviewResult) -> str:
+    body = review.summary or "AI review draft."
+    if review.pr_comments:
+        comments = "\n\n".join(f"- {comment}" for comment in review.pr_comments)
+        body = f"{body}\n\nPR-level comments:\n{comments}"
+    return body
+
+
 def print_review(review: ReviewResult) -> None:
     if review.summary:
         print(review.summary)
         print()
     if not review.comments:
         print("No inline comments.")
+    if review.pr_comments:
+        print("PR-level comments:")
+        for comment in review.pr_comments:
+            print(f"- {comment}")
+        print()
+    if not review.comments:
         return
     for index, comment in enumerate(review.comments, start=1):
         print(f"{index}. {comment.path}:{comment.line}")
@@ -470,6 +682,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-prompt",
         help="Write the generated reviewer prompt to this file.",
     )
+    parser.add_argument(
+        "--jira-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Load Jira ticket context through mcporter before reviewing.",
+    )
+    parser.add_argument(
+        "--jira-auth",
+        action="store_true",
+        help="Run `mcporter auth jira`, then exit if no PR URL is provided.",
+    )
     return parser
 
 
@@ -477,14 +700,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     config = build_config(args)
+    if args.jira_auth:
+        mcporter_auth(DEFAULT_JIRA_MCP_SERVER, DEFAULT_MCP_TIMEOUT_MS)
+        if not args.pr_url:
+            return 0
     if not args.pr_url:
         parser.error("the following arguments are required: pr_url")
     ref = parse_pr_url(args.pr_url)
     pr = load_pr(ref)
 
     checkout = ensure_checkout(pr, config.cache_dir)
+    first_comment = load_first_pr_comment(ref) if config.jira.enabled else ""
+    jira_context = load_jira_context(config.jira, pr, first_comment, checkout, config.codex_model)
     diff = load_diff(ref)
-    prompt = build_prompt(pr, diff)
+    prompt = build_prompt(pr, diff, jira_context)
     if config.save_prompt:
         config.save_prompt.parent.mkdir(parents=True, exist_ok=True)
         config.save_prompt.write_text(prompt, encoding="utf-8")
@@ -497,8 +726,8 @@ def main(argv: list[str] | None = None) -> int:
     print_review(review)
 
     if config.publish_pending:
-        if not review.comments:
-            raise SystemExit("No valid inline comments to publish.")
+        if not review.comments and not review.pr_comments and not review.summary:
+            raise SystemExit("No review content to publish.")
         review_id = create_pending_review(pr, review)
         print(f"Created pending GitHub review #{review_id}. It has not been submitted.")
 

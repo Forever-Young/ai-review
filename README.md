@@ -65,6 +65,9 @@ save_prompt = ~/tmp/ai-review-prompt.txt
 
 [github]
 publish_pending = yes
+
+[jira]
+enabled = no
 ```
 
 `provider = codex` is the default and currently the only supported provider
@@ -77,6 +80,49 @@ CLI arguments override the config file.
 review with draft inline comments. It never submits the review; you still edit,
 delete, or submit comments yourself in GitHub. Use `--no-publish-pending` or set
 `publish_pending = no` for local output only.
+
+## Jira MCP Context
+
+Jira context is optional and uses the `mcporter` CLI as the MCP bridge. Install
+the package extra as a marker for Jira-enabled installs:
+
+```sh
+python3 -m pip install ".[jira]"
+```
+
+Then install MCPorter itself:
+
+```sh
+npm install -g mcporter
+mcporter list
+```
+
+Configure a Jira MCP server in a config that MCPorter can discover, then enable
+Jira context:
+
+```ini
+[jira]
+enabled = yes
+```
+
+Authenticate the configured Jira MCP server:
+
+```sh
+ai-review --jira-auth
+```
+
+You normally only need to do this once. If Jira is enabled and a later MCP call
+fails with an authentication or expired-token error, `ai-review` automatically
+runs `mcporter auth jira` and retries the Jira context request once. That may
+open a browser OAuth page when cached credentials are missing or stale.
+
+When Jira is enabled, `ai-review` extracts a ticket key from the PR branch,
+title, body, or first PR comment. It recognizes keys like `ABC-123` and
+`ABC12-123`; comments such as `Refs: ABC-123` also work. If a simple scan cannot
+find the key, Codex is asked to extract it from the same PR metadata. It then
+loads Jira issue description, comments, and attachments/images through the
+configured MCPorter Jira server and includes that context in the review prompt
+so Codex can flag PR-level gaps as well as inline code issues.
 
 ## Usage
 

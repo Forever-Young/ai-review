@@ -20,5 +20,8 @@ classifiers = [
 [project.scripts]
 ai-review = "ai_review.cli:main"
 
+[project.optional-dependencies]
+jira = []
+
 [tool.setuptools.packages.find]
 include = ["ai_review*"]
