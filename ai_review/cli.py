@@ -48,7 +48,7 @@ DEFAULT_TELEGRAM_BOT_TOKEN = ""
 DEFAULT_TELEGRAM_JIRA_AUTH_VIA_TELEGRAM = False
 DEFAULT_MCP_TIMEOUT_MS = 60_000
 MAX_CONTEXT_CHARS = 60_000
-TICKET_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+TICKET_KEY_RE = re.compile(r"\b([A-Z]+[0-9]*-\d+)\b")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 AUTH_ERROR_PATTERNS = (
     "401",
@@ -857,9 +857,43 @@ def extract_ticket_key_with_ai_provider(
 
 
 def extract_ticket_key(pr: PullRequest, first_comment: str, provider: str, model: str | None) -> str | None:
-    return extract_ticket_key_with_ai_provider(pr, first_comment, provider, model) or extract_ticket_key_heuristic(
-        pr, first_comment
+    return extract_ticket_key_heuristic(pr, first_comment) or extract_ticket_key_with_ai_provider(
+        pr, first_comment, provider, model
     )
+
+
+def is_jira_ticket_not_found_error(message: str) -> bool:
+    normalized = message.lower()
+    return any(
+        pattern in normalized
+        for pattern in (
+            "404",
+            "issue does not exist",
+            "issue not found",
+            "not found",
+            "no issue was found",
+        )
+    )
+
+
+def load_jira_context_for_ticket(ticket_key: str) -> str:
+    parts = [f"Ticket key: {ticket_key}\n"]
+    parts.append(fetch_jira_tool_context("Issue", DEFAULT_JIRA_ISSUE_TOOL, DEFAULT_JIRA_ISSUE_ARG, ticket_key, DEFAULT_MCP_TIMEOUT_MS))
+    parts.append(
+        fetch_jira_tool_context(
+            "Comments", DEFAULT_JIRA_COMMENTS_TOOL, DEFAULT_JIRA_ISSUE_ARG, ticket_key, DEFAULT_MCP_TIMEOUT_MS
+        )
+    )
+    parts.append(
+        fetch_jira_tool_context(
+            "Attachments/images",
+            DEFAULT_JIRA_ATTACHMENTS_TOOL,
+            DEFAULT_JIRA_ISSUE_ARG,
+            ticket_key,
+            DEFAULT_MCP_TIMEOUT_MS,
+        )
+    )
+    return trim_context("\n".join(part for part in parts if part))
 
 
 def mcporter_auth(server: str, timeout_ms: int) -> None:
@@ -910,29 +944,24 @@ def load_jira_context(
         status("Skipping Jira context", "disabled")
         return None
     status("Checking Jira context")
-    ticket_key = extract_ticket_key(pr, first_comment, ai_provider, model)
+    ticket_key = extract_ticket_key_heuristic(pr, first_comment)
+    if not ticket_key:
+        ticket_key = extract_ticket_key_with_ai_provider(pr, first_comment, ai_provider, model)
     if not ticket_key:
         status("No Jira ticket key found")
         return "Jira was enabled, but no ticket key could be extracted from the branch, PR title, PR body, or first PR comment."
 
     status("Found Jira ticket", ticket_key)
-    parts = [f"Ticket key: {ticket_key}\n"]
-    parts.append(fetch_jira_tool_context("Issue", DEFAULT_JIRA_ISSUE_TOOL, DEFAULT_JIRA_ISSUE_ARG, ticket_key, DEFAULT_MCP_TIMEOUT_MS))
-    parts.append(
-        fetch_jira_tool_context(
-            "Comments", DEFAULT_JIRA_COMMENTS_TOOL, DEFAULT_JIRA_ISSUE_ARG, ticket_key, DEFAULT_MCP_TIMEOUT_MS
-        )
-    )
-    parts.append(
-        fetch_jira_tool_context(
-            "Attachments/images",
-            DEFAULT_JIRA_ATTACHMENTS_TOOL,
-            DEFAULT_JIRA_ISSUE_ARG,
-            ticket_key,
-            DEFAULT_MCP_TIMEOUT_MS,
-        )
-    )
-    return trim_context("\n".join(part for part in parts if part))
+    try:
+        return load_jira_context_for_ticket(ticket_key)
+    except SystemExit as exc:
+        if not is_jira_ticket_not_found_error(str(exc)):
+            raise
+        fallback_key = extract_ticket_key_with_ai_provider(pr, first_comment, ai_provider, model)
+        if not fallback_key or fallback_key == ticket_key:
+            raise
+        status("Primary Jira ticket was not found, retrying with AI-extracted key", fallback_key)
+        return load_jira_context_for_ticket(fallback_key)
 
 
 def run_codex(prompt: str, cwd: Path | None, model: str | None) -> str:

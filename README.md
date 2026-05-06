@@ -265,10 +265,11 @@ browser OAuth page when cached credentials are missing or stale.
 When Jira is enabled, `ai-review` extracts a ticket key from the PR branch,
 title, body, or first PR comment. It recognizes keys like `ABC-123` and
 `ABC12-123`; comments such as `Refs: ABC-123` also work. If a simple scan cannot
-find the key, the selected AI provider is asked to extract it from the same PR metadata. It then
-loads Jira issue description, comments, and attachments/images through the
-configured MCPorter Jira server and includes that context in the review prompt
-so the provider can flag PR-level gaps as well as inline code issues.
+find the key, the selected AI provider is asked to extract it. If a parsed key is
+found but Jira reports it missing, `ai-review` retries once with the AI-extracted
+key. It then loads Jira issue description, comments, and attachments/images
+through the configured MCPorter Jira server and includes that context in the
+review prompt so the provider can flag PR-level gaps as well as inline code issues.
 
 ## Usage
 

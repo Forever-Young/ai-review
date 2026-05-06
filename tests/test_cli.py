@@ -28,6 +28,7 @@ from ai_review.cli import (
     ensure_checkout,
     is_auth_error,
     load_pr_discussion_context,
+    load_jira_context,
     main,
     parse_pr_url,
     parse_review,
@@ -78,6 +79,53 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertEqual(extract_ticket_key_heuristic(pr, "Refs: ABC-123"), "ABC-123")
+
+    def test_extract_ticket_key_from_pr_title_with_letters_and_digits_prefix(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="AVO24-256 ETL-API: Add Active Review Tasks Endpoint to Review Queue API",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+
+        self.assertEqual(extract_ticket_key_heuristic(pr, ""), "AVO24-256")
+
+    def test_load_jira_context_falls_back_to_ai_only_after_jira_not_found(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="AVO24-256 ETL-API: Add Active Review Tasks Endpoint to Review Queue API",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+        jira_config = type("JiraConfigStub", (), {"enabled": True})()
+        fetch_calls: list[str] = []
+
+        def fake_fetch(*_args, **_kwargs):
+            ticket_key = _args[3]
+            fetch_calls.append(ticket_key)
+            if ticket_key == "AVO24-256":
+                raise SystemExit("404 issue not found")
+            return '{"ok": true}'
+
+        with patch("ai_review.cli.fetch_jira_tool_context", side_effect=fake_fetch), patch(
+            "ai_review.cli.extract_ticket_key_with_ai_provider", return_value="ABC12-123"
+        ) as ai_extract_mock:
+            context = load_jira_context(jira_config, pr, "", "codex", None)
+
+        self.assertIn("Ticket key: ABC12-123", context)
+        self.assertEqual(fetch_calls[0], "AVO24-256")
+        self.assertEqual(fetch_calls[1], "ABC12-123")
+        ai_extract_mock.assert_called_once()
 
     def test_changed_right_lines_tracks_added_lines(self):
         diff = """diff --git a/app.py b/app.py
