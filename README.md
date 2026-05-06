@@ -97,6 +97,8 @@ keys. Set `git.ssh_command` instead when you want to provide the complete
 `publish_pending = yes` creates an unsubmitted GitHub pending review with draft
 inline comments. The review remains editable in GitHub until you submit it. Use
 `--no-publish-pending` or set `publish_pending = no` for local output.
+When a pending review by the authenticated GitHub user already exists,
+`ai-review` replaces that draft with the newly generated review.
 
 Set `github.token` to a GitHub token when `gh` should run non-interactively
 without relying on a saved GitHub CLI login. `ai-review` passes the value to

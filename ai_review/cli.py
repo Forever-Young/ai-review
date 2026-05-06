@@ -96,6 +96,13 @@ class ReviewResult:
 
 
 @dataclass(frozen=True)
+class PendingReviewResult:
+    review_id: int
+    html_url: str
+    replaced_existing: bool
+
+
+@dataclass(frozen=True)
 class JiraConfig:
     enabled: bool
 
@@ -699,7 +706,11 @@ def validate_comments(review: ReviewResult, changed: dict[str, set[int]], max_co
     return ReviewResult(summary=review.summary, comments=valid[:max_comments], pr_comments=review.pr_comments)
 
 
-def create_pending_review(pr: PullRequest, review: ReviewResult, github_token: str | None = None) -> int:
+def pending_review_url(pr: PullRequest, review_id: int) -> str:
+    return f"{pr.html_url}#pullrequestreview-{review_id}"
+
+
+def create_pending_review(pr: PullRequest, review: ReviewResult, github_token: str | None = None) -> tuple[int, str]:
     status("Creating pending GitHub review", f"{len(review.comments)} inline, {len(review.pr_comments)} PR-level")
     payload = {
         "commit_id": pr.head_sha,
@@ -720,7 +731,59 @@ def create_pending_review(pr: PullRequest, review: ReviewResult, github_token: s
         body=payload,
         github_token=github_token,
     )
-    return int(json.loads(raw)["id"])
+    data = json.loads(raw)
+    review_id = int(data["id"])
+    return review_id, str(data.get("html_url") or pending_review_url(pr, review_id))
+
+
+def load_authenticated_github_login(github_token: str | None = None) -> str:
+    status("Loading authenticated GitHub user")
+    raw = gh_api("user", github_token=github_token)
+    login = json.loads(raw).get("login")
+    if not login:
+        raise SystemExit("Could not determine authenticated GitHub user.")
+    return str(login)
+
+
+def find_pending_review_id(pr: PullRequest, github_token: str | None = None) -> int | None:
+    login = load_authenticated_github_login(github_token)
+    status("Checking for existing pending review", login)
+    pending_review_id: int | None = None
+    page = 1
+    while True:
+        raw = gh_api(
+            f"repos/{pr.ref.owner}/{pr.ref.repo}/pulls/{pr.ref.number}/reviews?per_page=100&page={page}",
+            github_token=github_token,
+        )
+        reviews = json.loads(raw)
+        for item in reviews:
+            user = item.get("user") or {}
+            if str(item.get("state") or "").upper() == "PENDING" and user.get("login") == login:
+                pending_review_id = int(item["id"])
+        if len(reviews) < 100:
+            return pending_review_id
+        page += 1
+
+
+def delete_pending_review(pr: PullRequest, review_id: int, github_token: str | None = None) -> None:
+    status("Deleting existing pending review", f"#{review_id}")
+    gh_api(
+        f"repos/{pr.ref.owner}/{pr.ref.repo}/pulls/{pr.ref.number}/reviews/{review_id}",
+        method="DELETE",
+        github_token=github_token,
+    )
+
+
+def create_or_replace_pending_review(
+    pr: PullRequest,
+    review: ReviewResult,
+    github_token: str | None = None,
+) -> PendingReviewResult:
+    existing_review_id = find_pending_review_id(pr, github_token)
+    if existing_review_id is not None:
+        delete_pending_review(pr, existing_review_id, github_token)
+    review_id, html_url = create_pending_review(pr, review, github_token)
+    return PendingReviewResult(review_id=review_id, html_url=html_url, replaced_existing=existing_review_id is not None)
 
 
 def build_review_body(review: ReviewResult) -> str:
@@ -833,8 +896,12 @@ def main(argv: list[str] | None = None) -> int:
     if config.publish_pending:
         if not review.comments and not review.pr_comments and not review.summary:
             raise SystemExit("No review content to publish.")
-        review_id = create_pending_review(pr, review, config.github_token)
-        print(f"Created pending GitHub review #{review_id}. It has not been submitted.")
+        result = create_or_replace_pending_review(pr, review, config.github_token)
+        if result.replaced_existing:
+            print(f"Updated pending GitHub review #{result.review_id}. It has not been submitted.")
+        else:
+            print(f"Created pending GitHub review #{result.review_id}. It has not been submitted.")
+        print(f"Open pending review: {result.html_url}")
 
     return 0
 

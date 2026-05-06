@@ -15,6 +15,8 @@ from ai_review.cli import (
     build_config,
     build_review_body,
     changed_right_lines,
+    create_or_replace_pending_review,
+    create_pending_review,
     extract_ticket_key_heuristic,
     fetch_jira_tool_context,
     gh_api,
@@ -376,6 +378,95 @@ ssh_command = ssh -i ~/.ssh/other_key
             gh_api("repos/example/project/pulls/42", github_token=None)
 
         self.assertIsNone(run_mock.call_args.kwargs["env"])
+
+    def test_create_or_replace_pending_review_replaces_current_user_pending_review(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Add feature",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+        review = parse_review(json.dumps({"summary": "summary", "comments": []}))
+
+        with patch(
+            "ai_review.cli.gh_api",
+            side_effect=[
+                '{"login": "me"}',
+                json.dumps(
+                    [
+                        {"id": 80, "state": "PENDING", "user": {"login": "other"}},
+                        {"id": 81, "state": "PENDING", "user": {"login": "me"}},
+                    ]
+                ),
+                '{"id": 81}',
+                '{"id": 82, "html_url": "https://github.com/example/project/pull/42#pullrequestreview-82"}',
+            ],
+        ) as gh_mock:
+            result = create_or_replace_pending_review(pr, review, github_token="ghp_example")
+
+        self.assertTrue(result.replaced_existing)
+        self.assertEqual(result.review_id, 82)
+        self.assertEqual(result.html_url, "https://github.com/example/project/pull/42#pullrequestreview-82")
+        self.assertEqual(gh_mock.call_args_list[0].args[0], "user")
+        self.assertEqual(gh_mock.call_args_list[1].args[0], "repos/example/project/pulls/42/reviews?per_page=100&page=1")
+        self.assertEqual(gh_mock.call_args_list[2].args[0], "repos/example/project/pulls/42/reviews/81")
+        self.assertEqual(gh_mock.call_args_list[2].kwargs["method"], "DELETE")
+        self.assertEqual(gh_mock.call_args_list[3].args[0], "repos/example/project/pulls/42/reviews")
+
+    def test_create_or_replace_pending_review_creates_when_no_current_user_pending_review(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Add feature",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+        review = parse_review(json.dumps({"summary": "summary", "comments": []}))
+
+        with patch(
+            "ai_review.cli.gh_api",
+            side_effect=[
+                '{"login": "me"}',
+                json.dumps([{"id": 80, "state": "PENDING", "user": {"login": "other"}}]),
+                '{"id": 82, "html_url": "https://github.com/example/project/pull/42#pullrequestreview-82"}',
+            ],
+        ) as gh_mock:
+            result = create_or_replace_pending_review(pr, review, github_token="ghp_example")
+
+        self.assertFalse(result.replaced_existing)
+        self.assertEqual(result.review_id, 82)
+        self.assertEqual(result.html_url, "https://github.com/example/project/pull/42#pullrequestreview-82")
+        self.assertEqual(len(gh_mock.call_args_list), 3)
+        self.assertEqual(gh_mock.call_args_list[2].args[0], "repos/example/project/pulls/42/reviews")
+
+    def test_create_pending_review_builds_fallback_url(self):
+        pr = PullRequest(
+            ref=PullRequestRef("example", "project", 42),
+            title="Add feature",
+            body="",
+            html_url="https://github.com/example/project/pull/42",
+            base_clone_url="https://github.com/example/project.git",
+            base_ssh_url="git@github.com:example/project.git",
+            base_sha="base",
+            head_sha="head",
+            head_ref="feature/add-stuff",
+        )
+        review = parse_review(json.dumps({"summary": "summary", "comments": []}))
+
+        with patch("ai_review.cli.gh_api", return_value='{"id": 82}'):
+            review_id, html_url = create_pending_review(pr, review, github_token="ghp_example")
+
+        self.assertEqual(review_id, 82)
+        self.assertEqual(html_url, "https://github.com/example/project/pull/42#pullrequestreview-82")
 
     def test_cli_overrides_config_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
