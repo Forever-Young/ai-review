@@ -663,6 +663,9 @@ ssh_command = ssh -i ~/.ssh/other_key
             ),
         )
         self.assertEqual(first_call.kwargs["env"]["GIT_SSH_COMMAND"], "ssh -i /tmp/key -o IdentitiesOnly=yes")
+        checkout_call = run_mock.call_args_list[-1]
+        self.assertEqual(checkout_call.args[0][:3], ["git", "worktree", "add"])
+        self.assertEqual(checkout_call.kwargs["env"], first_call.kwargs["env"])
 
     def test_ensure_checkout_uses_https_without_ssh_command(self):
         pr = PullRequest(

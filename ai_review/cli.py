@@ -709,7 +709,12 @@ def ensure_checkout(pr: PullRequest, cache_dir: Path, git_ssh_command: str | Non
         run(["git", "worktree", "remove", "--force", str(worktree)], cwd=bare_repo)
 
     status("Creating PR worktree", str(worktree))
-    run(["git", "worktree", "add", "--force", "--detach", str(worktree), pr.head_sha], cwd=bare_repo)
+    # Checkout can download Git LFS objects and needs the same credentials as fetch.
+    run(
+        ["git", "worktree", "add", "--force", "--detach", str(worktree), pr.head_sha],
+        cwd=bare_repo,
+        env=network_env,
+    )
     return worktree
 
 

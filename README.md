@@ -121,7 +121,8 @@ as a whole-project investigation, and still runs with a read-only sandbox and
 disabled approval prompts.
 
 Set `git.ssh_key_path` when repository mirrors should be cloned and fetched
-over SSH with a specific key. When this is set, `ai-review` uses GitHub's SSH
+over SSH with a specific key. The same SSH settings apply to Git LFS downloads
+during PR worktree creation. When this is set, `ai-review` uses GitHub's SSH
 clone URL and passes git a `GIT_SSH_COMMAND` like:
 
 ```sh
